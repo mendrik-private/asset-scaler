@@ -11,6 +11,10 @@ keywords = ["image", "resize", "sprites", "pixel-art", "gamedev"]
 categories = ["multimedia::images", "game-development"]
 include = ["src/**", "tests/**", "examples/**", "Cargo.toml", "Cargo.lock", "README.md", "LICENSE"]
 
+[workspace]
+members = ["asset-background-removal", "asset-scaler-server"]
+resolver = "3"
+
 [dependencies]
 image = { version = "0.25.10", default-features = false }
 thiserror = "2"

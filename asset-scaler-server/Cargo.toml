@@ -1,0 +1,24 @@
+[package]
+name = "asset-scaler-server"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+description = "Loopback HTTP server for asset scaling and background removal"
+license = "GPL-3.0-only"
+publish = false
+
+[dependencies]
+asset-background-removal = { path = "../asset-background-removal" }
+asset-scaler = { path = ".." }
+axum = { version = "0.8", default-features = false, features = ["http1", "query", "tokio"] }
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "webp"] }
+reqwest = { version = "0.12", default-features = false }
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+tempfile = "3"
+
+[dev-dependencies]
+asset-background-removal = { path = "../asset-background-removal", features = ["test-support"] }
+tower = { version = "0.5", features = ["util"] }

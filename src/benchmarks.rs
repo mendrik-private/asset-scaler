@@ -3,6 +3,9 @@
 use super::*;
 use std::{hint::black_box, time::Instant};
 
+#[path = "readme_images.rs"]
+mod readme_images;
+
 fn report(case: &str, stage: &str, samples: &mut [f64], pixels: usize) {
     samples.sort_by(f64::total_cmp);
     let percentile = |p: f64| samples[((samples.len() - 1) as f64 * p).round() as usize];

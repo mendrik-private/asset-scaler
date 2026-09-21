@@ -1,0 +1,23 @@
+[package]
+name = "asset-background-removal"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+description = "Offline InSPyReNet runtime shared by local asset processors"
+license = "GPL-3.0-only"
+publish = false
+
+[features]
+test-support = []
+
+[dependencies]
+image = { version = "0.25.10", default-features = false, features = ["png"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tempfile = "3"
+tokio = { version = "1", features = ["fs", "macros", "process", "rt", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread"] }
