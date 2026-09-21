@@ -2,12 +2,16 @@
 
 `elf-source.png` is the supplied 800×800 transparent elf illustration, copied
 unchanged from `mule/assets/generated/characters/elf.png`. All other PNGs are
-generated from that source by the scaler, without retouching.
+generated from that source by the scaler, without retouching. The README displays
+the transparent assets inside `*-preview.svg` frames with a mid-gray
+(`#808080`) background. Each SVG embeds the original PNG unchanged; the
+background is only for presentation and does not alter the downloadable PNG.
 
 From the repository root, regenerate them with:
 
 ```sh
 cargo test -p asset-scaler --release --lib generate_readme_images -- --ignored
+python3 scripts/generate-readme-previews.py
 ```
 
 | File | Contents |
@@ -19,7 +23,10 @@ cargo test -p asset-scaler --release --lib generate_readme_images -- --ignored
 | `elf-aa-{0,50,100}.png` | Actual 200×200 outputs of `Prepared::resize` at the three AA settings. Transparency is preserved. |
 | `elf-aa-{0,50,100}-detail.png` | Crop at `(78,44)` with size 50×60 from each output, enlarged to 200×240 with nearest-neighbor. |
 
-The root README includes `image-rendering: pixelated;` for compatible renderers.
-GitHub [removes inline styles](https://github.com/github/markup#github-markup),
-so the detail crops encode their 4× pixel blocks directly in the PNG files.
+The SVG frames are generated using Python's standard library. They are
+self-contained, with no external image references or dependency on inline HTML
+styles. Diagnostic masks retain their black-to-white scale so their values
+remain readable.
+
+The detail crops encode their 4× pixel blocks directly in the PNG files.
 The full sprites are displayed at their native 200×200 size.
