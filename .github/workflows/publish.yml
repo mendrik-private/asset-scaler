@@ -31,6 +31,8 @@ jobs:
     needs: verify
     runs-on: ubuntu-latest
     environment: crates-io
+    env:
+      BOOTSTRAP_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
     permissions:
       contents: read
       id-token: write
@@ -40,7 +42,8 @@ jobs:
         with:
           toolchain: '1.92.0'
       - uses: rust-lang/crates-io-auth-action@v1
+        if: env.BOOTSTRAP_TOKEN == ''
         id: auth
       - run: cargo publish --locked
         env:
-          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token || secrets.CARGO_REGISTRY_TOKEN }}

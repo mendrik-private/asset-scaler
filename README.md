@@ -70,14 +70,20 @@ back to another account. Tokens are not stored in this repository.
 
 `.github/workflows/publish.yml` publishes a matching `v<VERSION>` tag pushed by
 `mendrik-private`, after formatting, Clippy, tests and packaging pass. Manual
-reruns must also select that tag. Publishing uses short-lived
+reruns must also select that tag. After bootstrap, publishing uses short-lived
 [crates.io trusted-publishing tokens](https://github.com/rust-lang/crates-io-auth-action),
 not the GitHub credential helper.
 
-Before the first release, use the intended crates.io owner account to register a
-trusted publisher for owner `mendrik-private`, repository `asset-scaler`, workflow
-`publish.yml`, environment `crates-io`. If initial publication requires a manual
-bootstrap, use that same owner's narrowly scoped crates.io token. No release tag
-or actual crates.io publication is performed by extraction/setup.
+For the first publication, set the `CARGO_REGISTRY_TOKEN` secret on the
+`crates-io` GitHub environment to a crates.io token from the intended owner
+account, scoped to publishing `asset-scaler`. The workflow uses that token when
+present, so it can bootstrap a new crate. GitHub credentials are not crates.io
+credentials.
+
+Once the crate exists, register its trusted publisher for owner
+`mendrik-private`, repository `asset-scaler`, workflow `publish.yml`, environment
+`crates-io`, then remove the bootstrap secret. Subsequent releases use OIDC.
+Only push a matching `v<VERSION>` tag when ready to publish; no release tag or
+actual crates.io publication is performed by extraction/setup.
 
 See the [Cargo publishing guide](https://doc.rust-lang.org/cargo/reference/publishing.html).
