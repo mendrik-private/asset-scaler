@@ -84,7 +84,80 @@ fn direct_source_lanczos_oracle(source: &color::LinearImage, w: u32, h: u32) -> 
 }
 
 #[test]
-fn silhouette_keeps_exterior_and_transparent_hidden_rgb_isolated() {
+fn outline_free_fill_uses_the_clean_fill_and_keeps_colour_modes_separate() {
+    let original = outlined_fixture(true);
+    let fill = RgbaImage::from_fn(original.width(), original.height(), |x, y| {
+        let alpha = original.get_pixel(x, y)[3];
+        image::Rgba([230, 170, 90, alpha])
+    });
+    let cancel = CancellationToken::default();
+    let prepared = Prepared::new(&original, &cancel).unwrap();
+    let target = prepared
+        .target_contours(&original, 31, 29, GameAssetAa::new(30), &cancel)
+        .unwrap();
+    let expected = direct_source_lanczos_oracle(&color::LinearImage::from_rgba(&fill), 31, 29);
+    let original_ink = resize_with_outline_free_fill(
+        &original,
+        &fill,
+        31,
+        29,
+        GameAssetAa::new(30),
+        OutlineColor::OriginalInk,
+        &cancel,
+    )
+    .unwrap();
+    let darkened_fill = resize_with_outline_free_fill(
+        &original,
+        &fill,
+        31,
+        29,
+        GameAssetAa::new(30),
+        OutlineColor::DarkenedFill { luminance: 0.25 },
+        &cancel,
+    )
+    .unwrap();
+    let clean_pixel = target
+        .strokes
+        .coverage
+        .as_raw()
+        .iter()
+        .enumerate()
+        .find_map(|(i, &coverage)| {
+            (coverage == 0 && expected.as_raw()[i * 4 + 3] == 255).then_some(i)
+        })
+        .expect("fixture must contain an opaque unpainted fill pixel");
+    assert_eq!(
+        &original_ink.as_raw()[clean_pixel * 4..clean_pixel * 4 + 4],
+        &expected.as_raw()[clean_pixel * 4..clean_pixel * 4 + 4],
+        "clean regions must come solely from the outline-free fill"
+    );
+    let core_pixel = target
+        .strokes
+        .core
+        .as_raw()
+        .iter()
+        .position(|&value| value == 255)
+        .expect("fixture must retain a contour core");
+    assert!(
+        darkened_fill.as_raw()[core_pixel * 4] > original_ink.as_raw()[core_pixel * 4],
+        "the fill-derived contour must not accidentally reuse original dark ink"
+    );
+    assert!(matches!(
+        resize_with_outline_free_fill(
+            &original,
+            &RgbaImage::new(1, 1),
+            31,
+            29,
+            GameAssetAa::new(30),
+            OutlineColor::OriginalInk,
+            &cancel,
+        ),
+        Err(Error::InvalidDimensions)
+    ));
+}
+
+#[test]
+fn silhouette_hides_flat_canvas_and_transparent_hidden_rgb() {
     let source = Arc::new(outlined_fixture(false));
     let cancel = CancellationToken::default();
     let session = Session::new(source.clone());
@@ -97,14 +170,11 @@ fn silhouette_keeps_exterior_and_transparent_hidden_rgb_isolated() {
     let target = prepared
         .target_contours(&source, 31, 29, GameAssetAa::new(0), &cancel)
         .unwrap();
-    assert!(
-        (0..coverage.len()).any(|i| {
-            coverage[i] < 0.5
-                && target.strokes.coverage.as_raw()[i] == 0
-                && current.as_raw()[i * 4..i * 4 + 4] == [37, 83, 149, 255]
-        }),
-        "fixture must preserve an unpainted opaque exterior"
-    );
+    for (i, &support) in coverage.iter().enumerate() {
+        if support < 0.5 && target.strokes.coverage.as_raw()[i] == 0 {
+            assert_eq!(&current.as_raw()[i * 4..i * 4 + 4], &[0; 4], "pixel {i}");
+        }
+    }
     let transparent = Arc::new(outlined_fixture(true));
     let transparent_session = Session::new(transparent);
     let transparent_result = transparent_session
@@ -166,10 +236,13 @@ fn silhouette_support_handles_every_small_downscale_shape_and_aa() {
                     .target_contours(&source, w, h, aa, &cancel)
                     .unwrap();
                 for (i, &support) in coverage.iter().enumerate() {
-                    if support == 0. && contours.strokes.coverage.as_raw()[i] == 0 {
+                    if support == 0.
+                        && contours.strokes.coverage.as_raw()[i] == 0
+                        && (w, h) != source.dimensions()
+                    {
                         assert_eq!(
                             output.get_pixel((i % w as usize) as u32, (i / w as usize) as u32),
-                            &image::Rgba([37, 83, 149, 255])
+                            &image::Rgba([0; 4])
                         );
                     }
                 }
