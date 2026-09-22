@@ -3,7 +3,7 @@
 use std::{collections::VecDeque, io::Cursor, path::Path, sync::Arc};
 
 use asset_background_removal::{InspyReNet, MaskFrame, apply_mask_to_rgba_with_feather};
-use asset_scaler::GameAssetAa;
+use asset_scaler::{GameAssetAa, Session};
 use image::{ImageBuffer, ImageFormat, ImageReader, Limits, Rgba, RgbaImage, imageops};
 use thiserror::Error;
 use tokio::sync::{OnceCell, mpsc};
@@ -135,22 +135,40 @@ impl AssetProcessor {
             .await
             .map_err(|error| AssetProcessingError::Processing(error.to_string()))??;
         check_cancelled(cancellation)?;
+        let source = Arc::new(source);
+        if requires_reduction(&source, options) {
+            if options.mask_mode == AssetMaskMode::Model {
+                validate_reduction_model_memory(source.dimensions(), options)?;
+            } else {
+                validate_scaler_memory(source.dimensions(), options)?;
+            }
+        } else if options.mask_mode == AssetMaskMode::Model {
+            // Keep the established model-only preflight for identity and
+            // enlargement, which do not retain prepared contour fields.
+            validate_model_memory(source.dimensions(), options)?;
+        }
+        // Preserve geometry from normalized, unmasked artwork. The foreground
+        // remains free to change alpha, but it is never reanalysed for contours.
+        let session = prepare_scale_session(source.clone(), options, cancellation).await?;
         if options.mask_mode == AssetMaskMode::EdgeMatte {
-            let source = tokio::task::spawn_blocking(move || edge_connected_matte(source))
-                .await
-                .map_err(|error| AssetProcessingError::Processing(error.to_string()))?;
+            let source =
+                tokio::task::spawn_blocking(move || edge_connected_matte((*source).clone()))
+                    .await
+                    .map_err(|error| AssetProcessingError::Processing(error.to_string()))?;
             let token = cancellation.clone();
-            let scaled = tokio::task::spawn_blocking(move || scale(&source, options, &token))
-                .await
-                .map_err(|error| AssetProcessingError::Processing(error.to_string()))??;
+            let scaled = tokio::task::spawn_blocking(move || {
+                scale(&source, options, &token, session.as_deref())
+            })
+            .await
+            .map_err(|error| AssetProcessingError::Processing(error.to_string()))??;
             check_cancelled(cancellation)?;
             return encode_rgba_png(&scaled);
         }
-        validate_model_memory(source.dimensions(), options)?;
 
         let directory = tempfile::tempdir()?;
         let source_path = directory.path().join("source.png");
-        tokio::task::spawn_blocking(move || write_rgba_png(&source_path, &source))
+        let model_source = source.clone();
+        tokio::task::spawn_blocking(move || write_rgba_png(&source_path, &model_source))
             .await
             .map_err(|error| AssetProcessingError::Processing(error.to_string()))??;
         let sources = vec![directory.path().join("source.png")];
@@ -170,7 +188,7 @@ impl AssetProcessor {
                 _ = consumer_cancel.cancelled() => return Err(AssetProcessingError::Processing("Downscaling was cancelled.".into())),
                 frame = receiver.recv() => frame.ok_or_else(|| AssetProcessingError::Processing("InSPyReNet did not emit a mask.".into()))?,
             };
-            process_mask(frame, options, consumer_cancel).await
+            process_mask(frame, options, session, consumer_cancel).await
         };
         tokio::pin!(producer);
         tokio::pin!(consumer);
@@ -214,6 +232,7 @@ impl AssetProcessor {
 async fn process_mask(
     frame: MaskFrame,
     options: AssetProcessingOptions,
+    session: Option<Arc<Session>>,
     cancellation: CancellationToken,
 ) -> Result<Vec<u8>, AssetProcessingError> {
     let worker_cancellation = cancellation.clone();
@@ -225,7 +244,7 @@ async fn process_mask(
             options.mask_feather_percent,
         )
         .map_err(AssetProcessingError::Processing)?;
-        scale(&masked, options, &worker_cancellation)
+        scale(&masked, options, &worker_cancellation, session.as_deref())
     })
     .await
     .map_err(|error| AssetProcessingError::Processing(error.to_string()))??;
@@ -247,6 +266,7 @@ fn scale(
     input: &RgbaImage,
     options: AssetProcessingOptions,
     token: &CancellationToken,
+    session: Option<&Session>,
 ) -> Result<RgbaImage, AssetProcessingError> {
     if input.width() == 0 || input.height() == 0 {
         return Err(AssetProcessingError::Processing(
@@ -263,15 +283,20 @@ fn scale(
     } else if factor >= 1.0 {
         enlarge(input, width, height)
     } else {
-        asset_scaler::resize_with_memory_limit(
-            input,
-            width,
-            height,
-            GameAssetAa::new(options.aa_percent),
-            &|| token.is_cancelled(),
-            CORE_SCALER_MEMORY_LIMIT,
-        )
-        .map_err(|error| AssetProcessingError::Processing(error.to_string()))?
+        session
+            .ok_or_else(|| {
+                AssetProcessingError::Processing(
+                    "missing original contour session for reduction".into(),
+                )
+            })?
+            .resize_with_foreground(
+                input,
+                width,
+                height,
+                GameAssetAa::new(options.aa_percent),
+                &|| token.is_cancelled(),
+            )
+            .map_err(|error| AssetProcessingError::Processing(error.to_string()))?
     };
     check_cancelled(token)?;
     let mut canvas = RgbaImage::new(options.width, options.height);
@@ -282,6 +307,33 @@ fn scale(
         i64::from((options.height - height) / 2),
     );
     Ok(canvas)
+}
+
+fn requires_reduction(source: &RgbaImage, options: AssetProcessingOptions) -> bool {
+    source.width() > 0
+        && source.height() > 0
+        && (options.width as f64 / source.width() as f64)
+            .min(options.height as f64 / source.height() as f64)
+            < 1.0
+}
+
+async fn prepare_scale_session(
+    source: Arc<RgbaImage>,
+    options: AssetProcessingOptions,
+    cancellation: &CancellationToken,
+) -> Result<Option<Arc<Session>>, AssetProcessingError> {
+    if !requires_reduction(&source, options) {
+        return Ok(None);
+    }
+    let session = Arc::new(Session::with_memory_limit(source, CORE_SCALER_MEMORY_LIMIT));
+    let worker = session.clone();
+    let token = cancellation.clone();
+    tokio::task::spawn_blocking(move || worker.prepare(&|| token.is_cancelled()))
+        .await
+        .map_err(|error| AssetProcessingError::Processing(error.to_string()))?
+        .map_err(|error| AssetProcessingError::Processing(error.to_string()))?;
+    check_cancelled(cancellation)?;
+    Ok(Some(session))
 }
 
 type FloatImage = ImageBuffer<Rgba<f32>, Vec<f32>>;
@@ -368,16 +420,46 @@ fn validate_model_memory(
     source: (u32, u32),
     options: AssetProcessingOptions,
 ) -> Result<(), AssetProcessingError> {
+    validate_memory(source, options, 512, model_memory_limit())
+}
+
+fn validate_reduction_model_memory(
+    source: (u32, u32),
+    options: AssetProcessingOptions,
+) -> Result<(), AssetProcessingError> {
+    validate_memory(
+        source,
+        options,
+        608,
+        model_memory_limit().min(CORE_SCALER_MEMORY_LIMIT),
+    )
+}
+
+fn validate_scaler_memory(
+    source: (u32, u32),
+    options: AssetProcessingOptions,
+) -> Result<(), AssetProcessingError> {
+    validate_memory(source, options, 608, CORE_SCALER_MEMORY_LIMIT)
+}
+
+fn validate_memory(
+    source: (u32, u32),
+    options: AssetProcessingOptions,
+    source_bytes: u64,
+    limit: u64,
+) -> Result<(), AssetProcessingError> {
+    // Reductions retain the original and its prepared contour fields until the
+    // separately generated foreground has been resampled, adding 96 bytes to
+    // the historic per-source working-set estimate.
     let estimate = u64::from(source.0)
         .saturating_mul(u64::from(source.1))
-        .saturating_mul(512)
+        .saturating_mul(source_bytes)
         .saturating_add(
             u64::from(options.width)
                 .saturating_mul(u64::from(options.height))
                 .saturating_mul(160),
         )
         .max(1);
-    let limit = model_memory_limit();
     if estimate > limit {
         return Err(AssetProcessingError::Processing(format!(
             "Game Asset scaling would exceed the {limit} byte memory limit."
@@ -497,10 +579,11 @@ mod model_processing_tests {
         std::fs::write(
             &python,
             r#"#!/usr/bin/env python3
-import json, os, struct, sys, zlib
+import json, os, shutil, struct, sys, zlib
 if "--runtime-identity" in sys.argv:
     print('{"backend":"fake","torch":"fake","hip":null}', flush=True)
     raise SystemExit(0)
+checkpoint = sys.argv[sys.argv.index("--checkpoint") + 1]
 with open(sys.argv[0] + ".starts", "a", encoding="utf-8") as starts:
     starts.write("start\n")
 print('{"event":"ready","runtime":{"backend":"fake"}}', flush=True)
@@ -509,6 +592,7 @@ def png_chunk(kind, data):
 for line in sys.stdin:
     request = json.loads(line)
     for index, source in enumerate(request["frames"]):
+        shutil.copyfile(source, checkpoint + ".received.png")
         with open(source, "rb") as image:
             header = image.read(24)
         width, height = struct.unpack(">II", header[16:24])
@@ -735,12 +819,18 @@ for line in sys.stdin:
         let root = tempfile::tempdir().unwrap();
         let processor = AssetProcessor::new(fake_runtime(root.path()));
         let source = RgbaImage::from_fn(400, 250, |x, y| {
-            Rgba([
-                (x % 251) as u8,
-                (y % 251) as u8,
-                120,
-                [64, 128, 255][((x + y) % 3) as usize],
-            ])
+            if x == 0 {
+                // The fake model gives x=0 a zero mask. It must nevertheless
+                // remain an original contour for the foreground resize.
+                Rgba([96, 0, 0, 255])
+            } else {
+                Rgba([
+                    (x % 251) as u8,
+                    (y % 251) as u8,
+                    120,
+                    [64, 128, 255][((x + y) % 3) as usize],
+                ])
+            }
         });
         let upload = png_bytes(&source);
         let token = CancellationToken::new();
@@ -786,7 +876,33 @@ for line in sys.stdin:
         .save(&mask_path)
         .unwrap();
         let masked = apply_mask_to_rgba_with_feather(&source_path, &mask_path, 0).unwrap();
-        let expected = scale(&masked, AssetProcessingOptions::default(), &token).unwrap();
+        let session = Arc::new(Session::with_memory_limit(
+            Arc::new(source.clone()),
+            CORE_SCALER_MEMORY_LIMIT,
+        ));
+        session.prepare(&|| token.is_cancelled()).unwrap();
+        let expected = scale(
+            &masked,
+            AssetProcessingOptions::default(),
+            &token,
+            Some(&session),
+        )
+        .unwrap();
+        let masked_only = asset_scaler::resize_with_memory_limit(
+            &masked,
+            200,
+            125,
+            GameAssetAa::new(AssetProcessingOptions::default().aa_percent),
+            &|| token.is_cancelled(),
+            CORE_SCALER_MEMORY_LIMIT,
+        )
+        .unwrap();
+        let mut masked_only_canvas = RgbaImage::new(200, 200);
+        imageops::replace(&mut masked_only_canvas, &masked_only, 0, 37);
+        assert_ne!(
+            expected, masked_only_canvas,
+            "the model mask removes x=0's dark original contour, so foreground-only analysis is not equivalent"
+        );
         for output in [&first, &second] {
             let output = image::load_from_memory(output).unwrap().into_rgba8();
             assert_eq!(output.dimensions(), (200, 200));
@@ -795,6 +911,13 @@ for line in sys.stdin:
             assert!(output.pixels().any(|pixel| pixel[3] > 0));
         }
         assert_eq!(first, explicit_defaults);
+        let model_input = image::open(root.path().join("checkpoint.pth.received.png"))
+            .unwrap()
+            .into_rgba8();
+        assert_eq!(
+            model_input, source,
+            "the model must receive the original image"
+        );
         let stronger_aa_expected = scale(
             &masked,
             AssetProcessingOptions {
@@ -802,6 +925,7 @@ for line in sys.stdin:
                 ..AssetProcessingOptions::default()
             },
             &token,
+            Some(&session),
         )
         .unwrap();
         assert_eq!(
@@ -820,6 +944,7 @@ for line in sys.stdin:
                 ..AssetProcessingOptions::default()
             },
             &token,
+            Some(&session),
         )
         .unwrap();
         let custom = image::load_from_memory(&custom).unwrap().into_rgba8();
@@ -847,6 +972,7 @@ mod tests {
                 ..Default::default()
             },
             &CancellationToken::new(),
+            None,
         )
         .unwrap();
         assert_eq!(image.dimensions(), (8, 8));

@@ -37,6 +37,7 @@ pub const DEFAULT_MEMORY_LIMIT: u64 = 4 * 1024 * 1024 * 1024;
 // four GiB, independently of the decoder and canvas safety limits.
 const SOURCE_PHASE_BYTES: u64 = 512;
 const TARGET_PHASE_BYTES: u64 = 160;
+const FOREGROUND_SOURCE_BYTES: u64 = 96;
 
 fn working_set_estimate(sw: u32, sh: u32, w: u32, h: u32) -> u64 {
     u64::from(sw)
@@ -51,6 +52,18 @@ fn working_set_estimate(sw: u32, sh: u32, w: u32, h: u32) -> u64 {
 
 fn check_working_set_budget(sw: u32, sh: u32, w: u32, h: u32, limit: u64) -> Result<()> {
     if working_set_estimate(sw, sh, w, h) > limit {
+        return Err(Error::GameAssetMemoryLimit { limit_bytes: limit });
+    }
+    Ok(())
+}
+
+fn check_foreground_working_set_budget(sw: u32, sh: u32, w: u32, h: u32, limit: u64) -> Result<()> {
+    let estimate = working_set_estimate(sw, sh, w, h).saturating_add(
+        u64::from(sw)
+            .saturating_mul(u64::from(sh))
+            .saturating_mul(FOREGROUND_SOURCE_BYTES),
+    );
+    if estimate > limit {
         return Err(Error::GameAssetMemoryLimit { limit_bytes: limit });
     }
     Ok(())
@@ -132,24 +145,27 @@ impl Prepared {
         )?;
         Ok(TargetContours { strokes, colors })
     }
-    fn resize(
+    fn resize_with_fill(
         &self,
-        image: &RgbaImage,
-        w: u32,
-        h: u32,
+        contour_source: &RgbaImage,
+        fill_linear: &color::LinearImage,
+        fill_silhouette: Option<&silhouette::Silhouette>,
+        target: (u32, u32),
         aa: GameAssetAa,
         cancel: &dyn Cancellation,
     ) -> Result<RgbaImage> {
-        let TargetContours { strokes, colors } = self.target_contours(image, w, h, aa, cancel)?;
+        let (w, h) = target;
+        let TargetContours { strokes, colors } =
+            self.target_contours(contour_source, w, h, aa, cancel)?;
         let strength = opacity::calculate(&self.widths, &strokes.core, &strokes.owners);
         let paint = opacity::apply(&strokes.coverage, &strokes.owners, &strength);
         let scale = [
-            w as f64 / image.width() as f64,
-            h as f64 / image.height() as f64,
+            w as f64 / contour_source.width() as f64,
+            h as f64 / contour_source.height() as f64,
         ];
         let mut retained_mask = self.contours.retained_ink_mask(&self.mask, scale, cancel)?;
         cancel.check()?;
-        let isolated = if let Some(silhouette) = &self.silhouette {
+        let isolated = if let Some(silhouette) = fill_silhouette {
             for (i, (masked, &supported)) in retained_mask
                 .data
                 .iter_mut()
@@ -161,24 +177,16 @@ impl Prepared {
                 }
                 *masked &= supported;
             }
-            Some(silhouette.isolated(&self.linear, cancel)?)
+            Some(silhouette.isolated(fill_linear, cancel)?)
         } else {
             None
         };
-        let fill_source = isolated.as_ref().unwrap_or(&self.linear);
+        let fill_source = isolated.as_ref().unwrap_or(fill_linear);
         let base = lanczos::resize(fill_source, w as usize, h as usize, cancel)?;
         let base = halo::apply(fill_source, &retained_mask, base, &strokes.core, cancel)?;
-        let fill = if let Some(silhouette) = &self.silhouette {
+        let fill = if let Some(silhouette) = fill_silhouette {
             let source_coverage = silhouette.coverage(w as usize, h as usize, cancel)?;
-            let retained_coverage =
-                silhouette.project_mask(&retained_mask, w as usize, h as usize, cancel)?;
-            let coverage = silhouette.target_coverage(
-                &source_coverage,
-                &retained_coverage,
-                &strokes.core,
-                aa,
-                cancel,
-            )?;
+            let coverage = silhouette.target_coverage(&source_coverage, aa, cancel)?;
             let opacity = silhouette.intrinsic_opacity(
                 fill_source,
                 &source_coverage,
@@ -186,7 +194,6 @@ impl Prepared {
                 h as usize,
                 cancel,
             )?;
-            let exterior = silhouette.exterior();
             let mut pixels = Vec::with_capacity(base.pixels.len());
             for (i, ((pixel, support), intrinsic)) in
                 base.pixels.iter().zip(coverage).zip(opacity).enumerate()
@@ -195,16 +202,10 @@ impl Prepared {
                     cancel.check()?;
                 }
                 let alpha = (intrinsic * support).clamp(0., 1.);
-                let out_alpha = alpha + exterior[3] * (1. - alpha);
-                pixels.push(if out_alpha <= 1e-8 {
+                pixels.push(if alpha <= 1e-8 {
                     [0.; 4]
                 } else {
-                    [
-                        (pixel[0] * alpha + exterior[0] * exterior[3] * (1. - alpha)) / out_alpha,
-                        (pixel[1] * alpha + exterior[1] * exterior[3] * (1. - alpha)) / out_alpha,
-                        (pixel[2] * alpha + exterior[2] * exterior[3] * (1. - alpha)) / out_alpha,
-                        out_alpha,
-                    ]
+                    [pixel[0], pixel[1], pixel[2], alpha]
                 });
             }
             color::LinearImage {
@@ -218,6 +219,45 @@ impl Prepared {
         let result = paint::composite(&fill, &colors, &paint);
         cancel.check()?;
         Ok(result)
+    }
+
+    fn resize(
+        &self,
+        image: &RgbaImage,
+        w: u32,
+        h: u32,
+        aa: GameAssetAa,
+        cancel: &dyn Cancellation,
+    ) -> Result<RgbaImage> {
+        self.resize_with_fill(
+            image,
+            &self.linear,
+            self.silhouette.as_ref(),
+            (w, h),
+            aa,
+            cancel,
+        )
+    }
+
+    fn resize_with_foreground(
+        &self,
+        original: &RgbaImage,
+        foreground: &RgbaImage,
+        w: u32,
+        h: u32,
+        aa: GameAssetAa,
+        cancel: &dyn Cancellation,
+    ) -> Result<RgbaImage> {
+        let fill_linear = color::LinearImage::from_rgba(foreground);
+        let fill_silhouette = silhouette::Silhouette::detect(foreground, cancel)?;
+        self.resize_with_fill(
+            original,
+            &fill_linear,
+            fill_silhouette.as_ref(),
+            (w, h),
+            aa,
+            cancel,
+        )
     }
 }
 #[derive(Default)]
@@ -244,6 +284,38 @@ impl Session {
             cache: Mutex::new(Cache::default()),
         }
     }
+
+    fn prepared(&self, cancel: &dyn Cancellation) -> Result<Arc<Prepared>> {
+        if let Some(prepared) = self
+            .cache
+            .lock()
+            .expect("Game Asset cache poisoned")
+            .prepared
+            .clone()
+        {
+            return Ok(prepared);
+        }
+        let prepared = Arc::new(Prepared::new(&self.source, cancel)?);
+        cancel.check()?;
+        self.cache
+            .lock()
+            .expect("Game Asset cache poisoned")
+            .prepared = Some(prepared.clone());
+        Ok(prepared)
+    }
+
+    /// Analyze the original artwork before an external background remover
+    /// changes its alpha or colours.
+    pub fn prepare(&self, cancel: &dyn Cancellation) -> Result<()> {
+        cancel.check()?;
+        let (sw, sh) = self.source.dimensions();
+        if sw == 0 || sh == 0 {
+            return Err(Error::InvalidDimensions);
+        }
+        check_working_set_budget(sw, sh, 1, 1, self.memory_limit)?;
+        self.prepared(cancel)?;
+        cancel.check()
+    }
     pub fn resize(
         &self,
         w: u32,
@@ -260,7 +332,7 @@ impl Session {
             return Ok((*self.source).clone());
         }
         check_working_set_budget(sw, sh, w, h, self.memory_limit)?;
-        let prepared = {
+        let cached = {
             let cache = self.cache.lock().expect("Game Asset cache poisoned");
             if let Some((key, result)) = &cache.target
                 && *key == (w, h, aa)
@@ -269,22 +341,43 @@ impl Session {
             }
             cache.prepared.clone()
         };
-        let prepared = match prepared {
-            Some(p) => p,
-            None => {
-                let p = Arc::new(Prepared::new(&self.source, cancel)?);
-                cancel.check()?;
-                self.cache
-                    .lock()
-                    .expect("Game Asset cache poisoned")
-                    .prepared = Some(p.clone());
-                p
-            }
-        };
+        let prepared = cached.map(Ok).unwrap_or_else(|| self.prepared(cancel))?;
         let result = prepared.resize(&self.source, w, h, aa, cancel)?;
         cancel.check()?;
         self.cache.lock().expect("Game Asset cache poisoned").target =
             Some(((w, h, aa), Arc::new(result.clone())));
+        Ok(result)
+    }
+
+    /// Resize a background-removed foreground while retaining contours and
+    /// source-width ink measured from the original session artwork.
+    pub fn resize_with_foreground(
+        &self,
+        foreground: &RgbaImage,
+        w: u32,
+        h: u32,
+        aa: GameAssetAa,
+        cancel: &dyn Cancellation,
+    ) -> Result<RgbaImage> {
+        cancel.check()?;
+        let (sw, sh) = self.source.dimensions();
+        if foreground.dimensions() != (sw, sh)
+            || w == 0
+            || h == 0
+            || sw == 0
+            || sh == 0
+            || w > sw
+            || h > sh
+        {
+            return Err(Error::InvalidDimensions);
+        }
+        if (w, h) == (sw, sh) {
+            return Ok(foreground.clone());
+        }
+        check_foreground_working_set_budget(sw, sh, w, h, self.memory_limit)?;
+        let prepared = self.prepared(cancel)?;
+        let result = prepared.resize_with_foreground(&self.source, foreground, w, h, aa, cancel)?;
+        cancel.check()?;
         Ok(result)
     }
 }

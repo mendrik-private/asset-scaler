@@ -84,7 +84,7 @@ fn direct_source_lanczos_oracle(source: &color::LinearImage, w: u32, h: u32) -> 
 }
 
 #[test]
-fn silhouette_keeps_exterior_and_transparent_hidden_rgb_isolated() {
+fn silhouette_hides_flat_canvas_and_transparent_hidden_rgb() {
     let source = Arc::new(outlined_fixture(false));
     let cancel = CancellationToken::default();
     let session = Session::new(source.clone());
@@ -97,14 +97,11 @@ fn silhouette_keeps_exterior_and_transparent_hidden_rgb_isolated() {
     let target = prepared
         .target_contours(&source, 31, 29, GameAssetAa::new(0), &cancel)
         .unwrap();
-    assert!(
-        (0..coverage.len()).any(|i| {
-            coverage[i] < 0.5
-                && target.strokes.coverage.as_raw()[i] == 0
-                && current.as_raw()[i * 4..i * 4 + 4] == [37, 83, 149, 255]
-        }),
-        "fixture must preserve an unpainted opaque exterior"
-    );
+    for (i, &support) in coverage.iter().enumerate() {
+        if support < 0.5 && target.strokes.coverage.as_raw()[i] == 0 {
+            assert_eq!(&current.as_raw()[i * 4..i * 4 + 4], &[0; 4], "pixel {i}");
+        }
+    }
     let transparent = Arc::new(outlined_fixture(true));
     let transparent_session = Session::new(transparent);
     let transparent_result = transparent_session
@@ -166,10 +163,13 @@ fn silhouette_support_handles_every_small_downscale_shape_and_aa() {
                     .target_contours(&source, w, h, aa, &cancel)
                     .unwrap();
                 for (i, &support) in coverage.iter().enumerate() {
-                    if support == 0. && contours.strokes.coverage.as_raw()[i] == 0 {
+                    if support == 0.
+                        && contours.strokes.coverage.as_raw()[i] == 0
+                        && (w, h) != source.dimensions()
+                    {
                         assert_eq!(
                             output.get_pixel((i % w as usize) as u32, (i / w as usize) as u32),
-                            &image::Rgba([37, 83, 149, 255])
+                            &image::Rgba([0; 4])
                         );
                     }
                 }

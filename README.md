@@ -120,12 +120,30 @@ allocation quota.
 ## Transparency and silhouettes
 
 For transparent images, source alpha defines the silhouette: internal ink lines
-do not cut holes into solid limbs or clothing. The scaler also preserves the
-tips of thin components on opaque, flat backgrounds. Regression tests cover
-both cases.
+do not cut holes into solid limbs or clothing. For an opaque image with a
+confidently flat, boundary-connected canvas, the scaler extracts that canvas as
+transparent support before reduction. Mixed or nonuniform canvases remain
+opaque because the library cannot infer a reliable exterior from them. Identity
+requests return the original pixels unchanged.
 
-The library does not remove backgrounds. Use the HTTP asset processor below
-when you need background removal as well as resizing.
+When a model removes the background first, preserve contours measured from the
+original artwork by preparing a session before removal and then supplying its
+foreground:
+
+```rust,no_run
+# use asset_scaler::{CancellationToken, GameAssetAa, Session};
+# use image::RgbaImage;
+# use std::sync::Arc;
+# let original = Arc::new(RgbaImage::new(400, 400));
+# let foreground = RgbaImage::new(400, 400);
+# let cancel = CancellationToken::default();
+let session = Session::new(original);
+session.prepare(&cancel)?;
+let sprite = session.resize_with_foreground(
+    &foreground, 200, 200, GameAssetAa::new(20), &cancel,
+)?;
+# Ok::<(), asset_scaler::Error>(())
+```
 
 ## HTTP asset processor
 
