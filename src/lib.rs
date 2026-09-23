@@ -5,7 +5,7 @@
 
 mod api;
 pub use api::{Cancellation, CancellationToken, Error, GameAssetAa, Result};
-use image::RgbaImage;
+use image::{GrayImage, RgbaImage};
 use std::sync::{Arc, Mutex};
 mod antialias;
 #[cfg(test)]
@@ -14,6 +14,7 @@ mod cleanup;
 mod color;
 mod contours;
 mod coverage;
+mod crowding;
 mod detect;
 mod field;
 mod foreground_halo;
@@ -111,6 +112,21 @@ fn check_foreground_working_set_budget(sw: u32, sh: u32, w: u32, h: u32, limit: 
     }
     Ok(())
 }
+
+fn binary_contour_image(mask: &raster::Mask) -> Result<GrayImage> {
+    let Some(image) = GrayImage::from_vec(
+        mask.w as u32,
+        mask.h as u32,
+        mask.data
+            .iter()
+            .map(|&contour| if contour { 0 } else { u8::MAX })
+            .collect(),
+    ) else {
+        return Err(Error::Scaling("Invalid contour mask dimensions".into()));
+    };
+    Ok(image)
+}
+
 struct Prepared {
     models: Vec<detect::Model>,
     widths: Vec<f64>,
@@ -123,11 +139,36 @@ struct Prepared {
 struct TargetContours {
     strokes: strokes::Strokes,
     colors: Vec<[f64; 3]>,
+    geometry: TargetGeometry,
+    suppress_unsupported: bool,
+    brightness: Option<f64>,
 }
+struct TargetGeometry {
+    curves: Vec<coverage::Quadratic>,
+    owners: Vec<usize>,
+    donors: Vec<detect::Model>,
+    donor_owners: Vec<usize>,
+    fitted_source: Option<FittedSource>,
+    scale: [f64; 2],
+}
+#[derive(Clone)]
+struct FittedSource {
+    curves: Vec<coverage::Quadratic>,
+    owners: Vec<usize>,
+    trace_donors: Vec<([f64; 2], usize)>,
+}
+#[derive(Clone, Copy)]
 struct InkSource<'a> {
     linear: &'a color::LinearImage,
     suppress_unsupported: bool,
     brightness: Option<f64>,
+}
+#[derive(Clone, Copy)]
+struct TargetRender<'source, 'cancel> {
+    target: (u32, u32),
+    aa: GameAssetAa,
+    ink_source: InkSource<'source>,
+    cancel: &'cancel dyn Cancellation,
 }
 struct ForegroundInkResize {
     w: u32,
@@ -221,6 +262,40 @@ impl Prepared {
         )
     }
 
+    fn polished_contour_mask(
+        &self,
+        source: &RgbaImage,
+        w: u32,
+        h: u32,
+        cancel: &dyn Cancellation,
+    ) -> Result<GrayImage> {
+        let scale = [
+            w as f64 / source.width() as f64,
+            h as f64 / source.height() as f64,
+        ];
+        let fitted = self
+            .contours
+            .polished(scale, contours::MAX_SHORT_PIXELS, cancel)?;
+        let curves: Vec<coverage::Quadratic> = fitted
+            .curves
+            .iter()
+            .map(|curve| {
+                curve.map(|p| [(p[0] + 0.5) * scale[0] - 0.5, (p[1] + 0.5) * scale[1] - 0.5])
+            })
+            .collect();
+        let strokes = strokes::render(
+            &curves,
+            &fitted.owners,
+            &self.widths,
+            w,
+            h,
+            GameAssetAa::new(0),
+            cancel,
+        )?;
+        GrayImage::from_raw(w, h, strokes.core.into_raw())
+            .ok_or_else(|| Error::Scaling("Invalid polished contour dimensions".into()))
+    }
+
     /// Keep original contour geometry while optionally coloring it from an
     /// aligned foreground. This remains private because ordinary resize calls
     /// must retain their established original-ink behavior.
@@ -233,6 +308,8 @@ impl Prepared {
         ink_source: InkSource<'_>,
         cancel: &dyn Cancellation,
     ) -> Result<TargetContours> {
+        let suppress_unsupported = ink_source.suppress_unsupported;
+        let brightness = ink_source.brightness;
         let scale = [
             w as f64 / image.width() as f64,
             h as f64 / image.height() as f64,
@@ -246,63 +323,276 @@ impl Prepared {
             contours::MAX_SHORT_PIXELS
         };
         let (retained, owners) = self.contours.retain_with_ids(&self.models, scale, cutoff);
-        let smoothed = smoothing::smooth(&retained, scale[0].min(scale[1]), cancel)?;
-        let curves: Vec<_> = smoothed
+        let use_splines = scale[0] < 1. || scale[1] < 1.;
+        let fitted = use_splines
+            .then(|| self.contours.polished(scale, cutoff, cancel))
+            .transpose()?;
+        let (curves, curve_owners): (Vec<coverage::Quadratic>, Vec<usize>) = if let Some(fitted) =
+            &fitted
+        {
+            // A path with no original local model has no established colour
+            // donor. Preserve the existing rule by not redrawing it in the
+            // colour pipeline; diagnostics can still display its geometry.
+            let supported: std::collections::HashSet<_> = owners.iter().copied().collect();
+            fitted
+                .curves
+                .iter()
+                .zip(&fitted.owners)
+                .filter(|(_, owner)| supported.contains(owner))
+                .map(|(curve, &owner)| {
+                    (
+                        curve.map(|p| {
+                            [(p[0] + 0.5) * scale[0] - 0.5, (p[1] + 0.5) * scale[1] - 0.5]
+                        }),
+                        owner,
+                    )
+                })
+                .unzip::<_, _, Vec<coverage::Quadratic>, Vec<usize>>()
+        } else {
+            let smoothed = &retained;
+            (
+                smoothed
+                    .iter()
+                    .map(|m| {
+                        detect::controls(m, 1.)
+                            .map(|p| [(p[0] + 0.5) * scale[0] - 0.5, (p[1] + 0.5) * scale[1] - 0.5])
+                    })
+                    .collect::<Vec<coverage::Quadratic>>(),
+                owners.clone(),
+            )
+        };
+        let geometry = TargetGeometry {
+            curves,
+            owners: curve_owners,
+            donors: retained,
+            donor_owners: owners,
+            fitted_source: fitted.map(|fit| FittedSource {
+                curves: fit.curves,
+                owners: fit.owners,
+                trace_donors: fit.trace_donors,
+            }),
+            scale,
+        };
+        let keep = vec![true; self.widths.len()];
+        let (strokes, colors) = self.render_target_geometry(
+            &geometry,
+            &keep,
+            TargetRender {
+                target: (w, h),
+                aa,
+                ink_source,
+                cancel,
+            },
+        )?;
+        Ok(TargetContours {
+            strokes,
+            colors,
+            geometry,
+            suppress_unsupported,
+            brightness,
+        })
+    }
+
+    fn render_target_geometry(
+        &self,
+        geometry: &TargetGeometry,
+        keep: &[bool],
+        render: TargetRender<'_, '_>,
+    ) -> Result<(strokes::Strokes, Vec<[f64; 3]>)> {
+        let TargetRender {
+            target: (w, h),
+            aa,
+            ink_source,
+            cancel,
+        } = render;
+        if keep.len() != self.widths.len() {
+            return Err(Error::Scaling("Invalid retained contour owners".into()));
+        }
+        let (curves, owners): (Vec<_>, Vec<_>) = geometry
+            .curves
             .iter()
-            .map(|m| {
-                detect::controls(m, 1.)
-                    .map(|p| [(p[0] + 0.5) * scale[0] - 0.5, (p[1] + 0.5) * scale[1] - 0.5])
-            })
-            .collect();
-        cancel.check()?;
+            .zip(&geometry.owners)
+            .filter(|&(_, &owner)| keep[owner])
+            .map(|(&curve, &owner)| (curve, owner))
+            .unzip();
         let mut strokes = strokes::render(&curves, &owners, &self.widths, w, h, aa, cancel)?;
-        let (mut colors, visible) = if ink_source.suppress_unsupported {
-            paint::ink_colors_with_visibility(
+        let (mut colors, visible) = if let Some(FittedSource {
+            curves: source_curves,
+            owners: source_owners,
+            trace_donors,
+        }) = &geometry.fitted_source
+        {
+            let (source_curves, source_owners): (Vec<_>, Vec<_>) = source_curves
+                .iter()
+                .zip(source_owners)
+                .filter(|&(_, &owner)| keep[owner])
+                .map(|(&curve, &owner)| (curve, owner))
+                .unzip();
+            paint::ink_colors_for_curves(
                 ink_source.linear,
-                &retained,
-                &smoothed,
-                &owners,
+                &source_curves,
+                &source_owners,
+                &geometry.donors,
+                &geometry.donor_owners,
+                trace_donors,
                 &strokes,
-                scale,
+                geometry.scale,
                 cancel,
             )?
         } else {
-            (
-                paint::ink_colors(
-                    ink_source.linear,
-                    &retained,
-                    &smoothed,
-                    &owners,
-                    &strokes,
-                    scale,
-                    cancel,
-                )?,
-                vec![true; strokes.coverage.as_raw().len()],
-            )
+            let (donors, owners): (Vec<_>, Vec<_>) = geometry
+                .donors
+                .iter()
+                .zip(&geometry.donor_owners)
+                .filter(|&(_, &owner)| keep[owner])
+                .map(|(&model, &owner)| (model, owner))
+                .unzip();
+            paint::ink_colors_with_visibility(
+                ink_source.linear,
+                &donors,
+                &donors,
+                &owners,
+                &strokes,
+                geometry.scale,
+                cancel,
+            )?
         };
-        if ink_source.suppress_unsupported {
+        if !ink_source.suppress_unsupported {
+            if let Some((i, _)) = strokes
+                .coverage
+                .as_raw()
+                .iter()
+                .zip(&visible)
+                .enumerate()
+                .find(|&(_, (&coverage, &visible))| coverage != 0 && !visible)
+            {
+                return Err(Error::Scaling(format!(
+                    "No visible source ink donor for target pixel {i}"
+                )));
+            }
+        } else {
             for (i, &supported) in visible.iter().enumerate() {
                 if i.is_multiple_of(4096) {
                     cancel.check()?;
                 }
-                if supported {
-                    continue;
+                if !supported {
+                    strokes.coverage.as_mut()[i] = 0;
+                    strokes.core.as_mut()[i] = 0;
+                    strokes.owners[i] = None;
                 }
-                strokes.coverage.as_mut()[i] = 0;
-                strokes.core.as_mut()[i] = 0;
-                strokes.owners[i] = None;
             }
         }
         if let Some(brightness) = ink_source.brightness {
-            for (i, ink_color) in colors.iter_mut().enumerate() {
+            for (i, color) in colors.iter_mut().enumerate() {
                 if i.is_multiple_of(4096) {
                     cancel.check()?;
                 }
-                *ink_color = color::scale_srgb(*ink_color, brightness);
+                *color = color::scale_srgb(*color, brightness);
             }
         }
-        Ok(TargetContours { strokes, colors })
+        Ok((strokes, colors))
     }
+
+    /// Apply whole-contour crowding decisions by rendering the surviving
+    /// geometry again. Pixel-level arbitration happens inside `strokes::render`,
+    /// so this restores a retained contour wherever a rejected owner had won
+    /// their initial overlap. Colors and visibility are recomputed from the
+    /// same-owner source donors for that new ownership map.
+    fn rerender_crowded_target(
+        &self,
+        contours: &mut TargetContours,
+        foreground_support: &[bool],
+        source_strengths: &[f64],
+        render: TargetRender<'_, '_>,
+    ) -> Result<bool> {
+        let keep = crowding::select(
+            &contours.strokes,
+            foreground_support,
+            &self.widths,
+            source_strengths,
+            render.cancel,
+        )?;
+        let rejected = keep.iter().any(|&keep| !keep);
+        if rejected {
+            let (strokes, colors) =
+                self.render_target_geometry(&contours.geometry, &keep, render)?;
+            contours.strokes = strokes;
+            contours.colors = colors;
+        }
+        Ok(rejected)
+    }
+
+    /// Return the binary target core used by the baseline foreground-ink
+    /// compositor before opacity, antialias coverage, colour, and halo work.
+    fn foreground_contour_mask(
+        &self,
+        original: &RgbaImage,
+        foreground: &RgbaImage,
+        w: u32,
+        h: u32,
+        aa: GameAssetAa,
+        cancel: &dyn Cancellation,
+    ) -> Result<GrayImage> {
+        let fill_linear = color::LinearImage::from_rgba(foreground);
+        let fill_silhouette = silhouette::Silhouette::detect(foreground, cancel)?;
+        let mut contours = self.target_contours_with_ink_source(
+            original,
+            w,
+            h,
+            aa,
+            InkSource {
+                linear: &fill_linear,
+                suppress_unsupported: true,
+                brightness: None,
+            },
+            cancel,
+        )?;
+        let fill = self.fill_for_target(
+            &fill_linear,
+            fill_silhouette.as_ref(),
+            &contours.strokes,
+            FillTarget {
+                target: (w, h),
+                aa,
+                foreground_support: true,
+            },
+            cancel,
+        )?;
+        let support = fill
+            .foreground_support
+            .as_deref()
+            .expect("foreground support was requested");
+        let ink_source = InkSource {
+            linear: &fill_linear,
+            suppress_unsupported: contours.suppress_unsupported,
+            brightness: contours.brightness,
+        };
+        self.rerender_crowded_target(
+            &mut contours,
+            support,
+            &self.contours.source_strengths(&self.models),
+            TargetRender {
+                target: (w, h),
+                aa,
+                ink_source,
+                cancel,
+            },
+        )?;
+        let raw = raster::Mask {
+            w: contours.strokes.core.width() as usize,
+            h: contours.strokes.core.height() as usize,
+            data: contours
+                .strokes
+                .core
+                .as_raw()
+                .iter()
+                .map(|&value| value != 0)
+                .collect(),
+        };
+        let canonical = target_cleanup::thin_outer(&raw, support, cancel)?;
+        binary_contour_image(&canonical)
+    }
+
     fn resize_with_fill(
         &self,
         contour_source: &RgbaImage,
@@ -330,7 +620,9 @@ impl Prepared {
         &self,
         fill_linear: &color::LinearImage,
         fill_silhouette: Option<&silhouette::Silhouette>,
-        TargetContours { strokes, colors }: TargetContours,
+        TargetContours {
+            strokes, colors, ..
+        }: TargetContours,
         target: (u32, u32),
         aa: GameAssetAa,
         cancel: &dyn Cancellation,
@@ -538,6 +830,43 @@ impl Prepared {
             .foreground_support
             .as_deref()
             .expect("foreground support was requested");
+        let ink_source = InkSource {
+            linear: fill_linear,
+            suppress_unsupported: contours.suppress_unsupported,
+            brightness: contours.brightness,
+        };
+        let rejected = self.rerender_crowded_target(
+            &mut contours,
+            support,
+            &self.contours.source_strengths(&self.models),
+            TargetRender {
+                target,
+                aa,
+                ink_source,
+                cancel,
+            },
+        )?;
+        // Halo repair sees contour cores. Rebuild only when arbitration
+        // removed an owner, so rejected interiors rely on scaled fill alone.
+        let fill = if rejected {
+            self.fill_for_target(
+                fill_linear,
+                fill_silhouette,
+                &contours.strokes,
+                FillTarget {
+                    target,
+                    aa,
+                    foreground_support: true,
+                },
+                cancel,
+            )?
+        } else {
+            fill
+        };
+        let support = fill
+            .foreground_support
+            .as_deref()
+            .expect("foreground support was requested");
         Self::canonicalize_foreground_strokes(
             &mut contours.strokes,
             &mut contours.colors,
@@ -672,8 +1001,9 @@ impl Prepared {
         request: FillResize,
         cancel: &dyn Cancellation,
     ) -> Result<RgbaImage> {
-        let TargetContours { strokes, colors } =
-            self.target_contours(original, request.w, request.h, request.aa, cancel)?;
+        let TargetContours {
+            strokes, colors, ..
+        } = self.target_contours(original, request.w, request.h, request.aa, cancel)?;
         let strength = opacity::calculate(&self.widths, &strokes.core, &strokes.owners);
         let paint = opacity::apply(&strokes.coverage, &strokes.owners, &strength);
         let fill_source = color::LinearImage::from_rgba(fill_source);
@@ -790,6 +1120,83 @@ impl Session {
         check_working_set_budget(sw, sh, 1, 1, self.memory_limit)?;
         self.prepared(cancel)?;
         cancel.check()
+    }
+
+    /// Return the source-resolution detected contour mask.
+    ///
+    /// Pixels are binary: `0` is a detected contour and `255` is background.
+    /// This reads the prepared source analysis only; it does not require a
+    /// removed foreground or render a scaled asset.
+    pub fn source_contour_mask(&self, cancel: &dyn Cancellation) -> Result<GrayImage> {
+        cancel.check()?;
+        let (sw, sh) = self.source.dimensions();
+        if sw == 0 || sh == 0 {
+            return Err(Error::InvalidDimensions);
+        }
+        check_working_set_budget(sw, sh, 1, 1, self.memory_limit)?;
+        let prepared = self.prepared(cancel)?;
+        cancel.check()?;
+        binary_contour_image(&prepared.mask)
+    }
+
+    /// Return a binary rendering of the ordered traces fitted as smooth
+    /// cubics. Unlike [`Self::source_contour_mask`], this is a visual
+    /// diagnostic and may move a contour fractionally within its source
+    /// support. It is available at source size for editor inspection.
+    pub fn polished_contour_mask(
+        &self,
+        w: u32,
+        h: u32,
+        cancel: &dyn Cancellation,
+    ) -> Result<GrayImage> {
+        cancel.check()?;
+        let (sw, sh) = self.source.dimensions();
+        if w == 0 || h == 0 || sw == 0 || sh == 0 || w > sw || h > sh {
+            return Err(Error::InvalidDimensions);
+        }
+        check_working_set_budget(sw, sh, w, h, self.memory_limit)?;
+        let prepared = self.prepared(cancel)?;
+        let core = prepared.polished_contour_mask(&self.source, w, h, cancel)?;
+        cancel.check()?;
+        binary_contour_image(&raster::Mask {
+            w: w as usize,
+            h: h as usize,
+            data: core.as_raw().iter().map(|&p| p != 0).collect(),
+        })
+    }
+
+    /// Return the post-cleanup foreground target contour core as a binary mask.
+    ///
+    /// This follows the same target stroke and foreground-support path as
+    /// [`Self::resize_with_foreground_ink`], then runs the established
+    /// `target_cleanup::thin_outer` canonicalization. It does not composite,
+    /// darken, or antialias the diagnostic image. Pixels are `0` for contour
+    /// and `255` for background.
+    pub fn foreground_contour_mask(
+        &self,
+        foreground: &RgbaImage,
+        w: u32,
+        h: u32,
+        aa: GameAssetAa,
+        cancel: &dyn Cancellation,
+    ) -> Result<GrayImage> {
+        cancel.check()?;
+        let (sw, sh) = self.source.dimensions();
+        if foreground.dimensions() != (sw, sh)
+            || w == 0
+            || h == 0
+            || sw == 0
+            || sh == 0
+            || w > sw
+            || h > sh
+        {
+            return Err(Error::InvalidDimensions);
+        }
+        check_foreground_working_set_budget(sw, sh, w, h, self.memory_limit)?;
+        let prepared = self.prepared(cancel)?;
+        let mask = prepared.foreground_contour_mask(&self.source, foreground, w, h, aa, cancel)?;
+        cancel.check()?;
+        Ok(mask)
     }
     pub fn resize(
         &self,

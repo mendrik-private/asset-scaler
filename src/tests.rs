@@ -21,6 +21,150 @@ fn outlined_fixture(transparent: bool) -> RgbaImage {
     })
 }
 
+fn expected_foreground_contour_mask(
+    prepared: &Prepared,
+    original: &RgbaImage,
+    foreground: &RgbaImage,
+    w: u32,
+    h: u32,
+    aa: GameAssetAa,
+    cancel: &dyn Cancellation,
+) -> GrayImage {
+    let fill_linear = color::LinearImage::from_rgba(foreground);
+    let fill_silhouette = silhouette::Silhouette::detect(foreground, cancel).unwrap();
+    let contours = prepared
+        .target_contours_with_ink_source(
+            original,
+            w,
+            h,
+            aa,
+            InkSource {
+                linear: &fill_linear,
+                suppress_unsupported: true,
+                brightness: None,
+            },
+            cancel,
+        )
+        .unwrap();
+    let fill = prepared
+        .fill_for_target(
+            &fill_linear,
+            fill_silhouette.as_ref(),
+            &contours.strokes,
+            FillTarget {
+                target: (w, h),
+                aa,
+                foreground_support: true,
+            },
+            cancel,
+        )
+        .unwrap();
+    let raw = raster::Mask {
+        w: w as usize,
+        h: h as usize,
+        data: contours
+            .strokes
+            .core
+            .as_raw()
+            .iter()
+            .map(|&value| value != 0)
+            .collect(),
+    };
+    let canonical =
+        target_cleanup::thin_outer(&raw, fill.foreground_support.as_deref().unwrap(), cancel)
+            .unwrap();
+    binary_contour_image(&canonical).unwrap()
+}
+
+#[test]
+fn session_exposes_binary_source_and_baseline_foreground_contour_masks() {
+    let original = Arc::new(outlined_fixture(true));
+    let foreground = original.as_ref().clone();
+    let cancel = CancellationToken::default();
+    let session = Session::new(original.clone());
+    let prepared = Prepared::new(&original, &cancel).unwrap();
+
+    let source = session.source_contour_mask(&cancel).unwrap();
+    assert_eq!(source.dimensions(), original.dimensions());
+    let expected_source = binary_contour_image(&prepared.mask).unwrap();
+    assert_eq!(source, expected_source);
+    assert!(
+        source
+            .pixels()
+            .all(|pixel| pixel[0] == 0 || pixel[0] == 255)
+    );
+
+    let mut across_aa = None;
+    for aa in [
+        GameAssetAa::new(0),
+        GameAssetAa::new(20),
+        GameAssetAa::new(100),
+    ] {
+        let target = session
+            .foreground_contour_mask(&foreground, 31, 29, aa, &cancel)
+            .unwrap();
+        assert_eq!(target.dimensions(), (31, 29));
+        assert_eq!(
+            target,
+            expected_foreground_contour_mask(
+                &prepared,
+                &original,
+                &foreground,
+                31,
+                29,
+                aa,
+                &cancel,
+            )
+        );
+        assert!(
+            target
+                .pixels()
+                .all(|pixel| pixel[0] == 0 || pixel[0] == 255)
+        );
+        if let Some(previous) = &across_aa {
+            assert_eq!(&target, previous, "binary core must not encode AA coverage");
+        }
+        across_aa = Some(target);
+    }
+}
+
+#[test]
+fn contour_mask_api_validates_dimensions_and_cancellation() {
+    let source = Arc::new(outlined_fixture(true));
+    let session = Session::new(source.clone());
+    let cancelled = CancellationToken::default();
+    cancelled.cancel();
+    assert!(matches!(
+        session.source_contour_mask(&cancelled),
+        Err(Error::Cancelled)
+    ));
+    assert!(matches!(
+        session.foreground_contour_mask(
+            &source,
+            0,
+            10,
+            GameAssetAa::new(0),
+            &CancellationToken::default(),
+        ),
+        Err(Error::InvalidDimensions)
+    ));
+    assert!(matches!(
+        session.foreground_contour_mask(
+            &RgbaImage::new(1, 1),
+            10,
+            10,
+            GameAssetAa::new(0),
+            &CancellationToken::default(),
+        ),
+        Err(Error::InvalidDimensions)
+    ));
+    assert!(matches!(
+        Session::new(Arc::new(RgbaImage::new(0, 0)))
+            .source_contour_mask(&CancellationToken::default()),
+        Err(Error::InvalidDimensions)
+    ));
+}
+
 fn source_alpha_footprint(source: &RgbaImage, x: u32, y: u32, w: u32, h: u32) -> (bool, f64, f64) {
     let sx = source.width() as f64 / w as f64;
     let sy = source.height() as f64 / h as f64;
@@ -707,6 +851,7 @@ fn foreground_ink_before_halo_cleanup(
     let TargetContours {
         mut strokes,
         mut colors,
+        ..
     } = prepared
         .target_contours_with_ink_source(
             original,
@@ -977,4 +1122,164 @@ fn cancelled_cached_requests_and_working_set_preflight_are_rejected() {
         }
     ));
     assert!(large.cache.lock().unwrap().prepared.is_none());
+}
+
+#[test]
+fn crowded_owner_rerender_restores_crossing_geometry_and_its_owner_color() {
+    let cancel = CancellationToken::default();
+    let mut source = RgbaImage::from_pixel(48, 48, image::Rgba([255, 255, 255, 255]));
+    // Each owner has a distinct source colour. B wins the initial C crossing,
+    // then crowding removes it; C must receive C's blue donor when retained
+    // geometry is rendered again.
+    for y in 4..44 {
+        source.put_pixel(4, y, image::Rgba([220, 30, 30, 255]));
+        source.put_pixel(6, y, image::Rgba([20, 210, 30, 255]));
+    }
+    for x in 6..44 {
+        source.put_pixel(x, 24, image::Rgba([30, 60, 230, 255]));
+    }
+    let mut prepared = Prepared::new(&source, &cancel).unwrap();
+    prepared.widths = vec![8., 6., 1.];
+    let line = |a: [f64; 2], b: [f64; 2]| -> coverage::Quadratic {
+        [a, [(a[0] + b[0]) * 0.5, (a[1] + b[1]) * 0.5], b]
+    };
+    let curves = vec![
+        line([4., 4.], [4., 43.]),
+        line([6., 4.], [6., 43.]),
+        line([6., 24.], [43., 24.]),
+    ];
+    let donors = vec![
+        [4., 4., 1., 0., 0., 0., 0., 0., 39., 1.],
+        [6., 4., 1., 0., 0., 0., 0., 0., 39., 1.],
+        [6., 24., 0., 1., 0., 0., 0., -37., 0., 1.],
+    ];
+    let source_linear = color::LinearImage::from_rgba(&source);
+    let blue: [f64; 3] = source_linear.pixels[24 * 48 + 30][..3].try_into().unwrap();
+    let crossing = 24 * 48 + 6;
+
+    // Exercise both ordinary retained models and the production fitted-source
+    // donor path. The latter is the reduced contour branch; brightness must be
+    // reapplied after a rerender instead of retaining a prior owner's colour.
+    for (fitted, brightness) in [(false, None), (true, Some(0.5))] {
+        let geometry = TargetGeometry {
+            curves: curves.clone(),
+            owners: vec![0, 1, 2],
+            donors: donors.clone(),
+            donor_owners: vec![0, 1, 2],
+            fitted_source: fitted.then(|| FittedSource {
+                curves: curves.clone(),
+                owners: vec![0, 1, 2],
+                trace_donors: vec![
+                    ([4., 4.], 0),
+                    ([4., 43.], 0),
+                    ([6., 4.], 1),
+                    ([6., 43.], 1),
+                    ([6., 24.], 2),
+                    ([43., 24.], 2),
+                ],
+            }),
+            scale: [1., 1.],
+        };
+        let ink = InkSource {
+            linear: &source_linear,
+            suppress_unsupported: false,
+            brightness,
+        };
+        let expected_blue = brightness.map_or(blue, |value| color::scale_srgb(blue, value));
+
+        for aa in [GameAssetAa::new(0), GameAssetAa::new(100)] {
+            let all = vec![true; 3];
+            let (strokes, colors) = prepared
+                .render_target_geometry(
+                    &geometry,
+                    &all,
+                    TargetRender {
+                        target: (48, 48),
+                        aa,
+                        ink_source: ink,
+                        cancel: &cancel,
+                    },
+                )
+                .unwrap();
+            assert_eq!(
+                strokes.owners[crossing],
+                Some(1),
+                "fitted={fitted}, AA{aa:?}: B must initially own the crossing"
+            );
+            let mut contours = TargetContours {
+                strokes,
+                colors,
+                geometry: TargetGeometry {
+                    curves: geometry.curves.clone(),
+                    owners: geometry.owners.clone(),
+                    donors: donors.clone(),
+                    donor_owners: vec![0, 1, 2],
+                    fitted_source: geometry.fitted_source.clone(),
+                    scale: [1., 1.],
+                },
+                suppress_unsupported: false,
+                brightness,
+            };
+            let rejected = prepared
+                .rerender_crowded_target(
+                    &mut contours,
+                    &[true; 48 * 48],
+                    &[1., 0.1, 10.],
+                    TargetRender {
+                        target: (48, 48),
+                        aa,
+                        ink_source: ink,
+                        cancel: &cancel,
+                    },
+                )
+                .unwrap();
+            assert!(rejected, "fitted={fitted}, AA{aa:?} setup must remove B");
+            assert!(
+                contours
+                    .strokes
+                    .owners
+                    .iter()
+                    .all(|&owner| owner != Some(1)),
+                "fitted={fitted}, AA{aa:?}: rejected B must have no pixels"
+            );
+
+            let (expected, expected_colors) = prepared
+                .render_target_geometry(
+                    &geometry,
+                    &[true, false, true],
+                    TargetRender {
+                        target: (48, 48),
+                        aa,
+                        ink_source: ink,
+                        cancel: &cancel,
+                    },
+                )
+                .unwrap();
+            assert_eq!(
+                contours.strokes.core, expected.core,
+                "fitted={fitted}, AA{aa:?} core"
+            );
+            assert_eq!(
+                contours.strokes.coverage, expected.coverage,
+                "fitted={fitted}, AA{aa:?} coverage"
+            );
+            assert_eq!(
+                contours.strokes.owners, expected.owners,
+                "fitted={fitted}, AA{aa:?} owners"
+            );
+            assert_eq!(
+                contours.colors, expected_colors,
+                "fitted={fitted}, AA{aa:?} colours"
+            );
+            assert_eq!(
+                contours.strokes.owners[crossing],
+                Some(2),
+                "fitted={fitted}, AA{aa:?}: retained C must recover B's crossing pixel"
+            );
+            assert_eq!(
+                contours.colors[crossing], expected_blue,
+                "fitted={fitted}, AA{aa:?}: recovered crossing must use C's donor and brightness"
+            );
+        }
+    }
 }

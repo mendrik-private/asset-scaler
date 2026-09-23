@@ -6,6 +6,7 @@ use crate::{
     detect::{Model, curve_point},
     field::{Spatial, distance2},
     raster::Mask,
+    smoothing::{self, SplineFit},
 };
 use std::collections::HashSet;
 
@@ -315,6 +316,67 @@ impl Contours {
             }
         }
         (retained, owners)
+    }
+
+    pub fn source_strengths(&self, models: &[Model]) -> Vec<f64> {
+        let mut strengths = vec![0_f64; self.lengths.len()];
+        for (model, owners) in models.iter().zip(&self.assignments) {
+            for &owner in owners {
+                strengths[owner] = strengths[owner].max(model[9].max(0.));
+            }
+        }
+        for &(owner, model) in &self.bridges {
+            strengths[owner] = strengths[owner].max(model[9].max(0.));
+        }
+        strengths
+    }
+
+    /// Explain each retained ordered digital trace with a small collection of
+    /// bounded cubic curves. The renderer later approximates them as
+    /// quadratics. This consumes the trace graph rather than
+    /// the detector's overlapping local patches, so a long hood or bow edge
+    /// can become one flowing curve while junction endpoints stay shared.
+    pub fn polished(
+        &self,
+        scale: [f64; 2],
+        max_removed: usize,
+        cancel: &dyn Cancellation,
+    ) -> Result<SplineFit> {
+        let selected = self.selected(scale, max_removed);
+        // Bound in the least-reduced target axis.  With [1, 0.25] a
+        // source-space fit may move by at most the source-sized allowance,
+        // rather than by four target pixels along the unreduced axis.
+        let scale = scale[0].max(scale[1]);
+        let mut occurrences = vec![0usize; self.points.len()];
+        for path in &self.paths {
+            let mut unique = path.clone();
+            unique.sort_unstable();
+            unique.dedup();
+            for node in unique {
+                occurrences[node] += 1;
+            }
+        }
+        let mut trace_donors = Vec::new();
+        let paths = self
+            .paths
+            .iter()
+            .enumerate()
+            .filter(|&(owner, _)| selected[owner])
+            .map(|(owner, path)| {
+                let points: Vec<_> = path.iter().map(|&node| self.points[node]).collect();
+                trace_donors.extend(points.iter().copied().map(|p| (p, owner)));
+                (
+                    owner,
+                    points,
+                    path.iter()
+                        .enumerate()
+                        .filter_map(|(index, &node)| (occurrences[node] > 1).then_some(index))
+                        .collect(),
+                )
+            });
+        let mut fitted = smoothing::fit_paths(paths, scale, cancel)?;
+        fitted.trace_donors = trace_donors;
+        Ok(fitted)
     }
 
     pub fn sample_owners(&self, samples: &[crate::detect::Sample]) -> Vec<Option<usize>> {

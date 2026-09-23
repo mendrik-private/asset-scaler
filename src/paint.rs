@@ -1,5 +1,6 @@
 use super::{
     color::{LinearImage, rgba},
+    coverage::Quadratic,
     detect::{Model, curve_point},
     field::{Spatial, distance2},
 };
@@ -29,6 +30,7 @@ fn source_color(source: &LinearImage, point: [f64; 2]) -> Option<[f64; 3]> {
     (total > 1e-8).then(|| sum.map(|v| v / total))
 }
 
+#[cfg(test)]
 pub fn ink_colors(
     source: &LinearImage,
     original: &[Model],
@@ -141,6 +143,159 @@ pub fn ink_colors_with_visibility(
     Ok((ink, visible))
 }
 
+/// Colour fitted path geometry from detector models that belong to the same
+/// contour owner.  Fitted curves and local detector models deliberately have
+/// different parameterizations, so pairing their `u` values would allow a
+/// long spline to sample the wrong piece of source ink.  Instead every spline
+/// sample keeps the nearest same-owner source donor.
+// The renderer, fitted geometry, and source-owner donor sets are independent
+// inputs; a bundle would only obscure their distinct lifetimes at call sites.
+#[allow(clippy::too_many_arguments)]
+pub fn ink_colors_for_curves(
+    source: &LinearImage,
+    curves: &[Quadratic],
+    curve_owners: &[usize],
+    donors: &[Model],
+    donor_owners: &[usize],
+    trace_donors: &[([f64; 2], usize)],
+    strokes: &super::strokes::Strokes,
+    scale: [f64; 2],
+    cancel: &dyn Cancellation,
+) -> Result<(Vec<[f64; 3]>, Vec<bool>)> {
+    if curves.len() != curve_owners.len() || donors.len() != donor_owners.len() {
+        return Err(crate::Error::Scaling(
+            "Invalid fitted contour donors".into(),
+        ));
+    }
+    let mut donor_points = Vec::with_capacity(donors.len() * 8 + trace_donors.len());
+    let mut donor_colors = Vec::with_capacity(donors.len() * 8 + trace_donors.len());
+    let mut donor_ids = Vec::with_capacity(donors.len() * 8 + trace_donors.len());
+    for (model, &owner) in donors.iter().zip(donor_owners) {
+        cancel.check()?;
+        let count = (((model[8] - model[7]).abs() / 0.2).ceil() as usize).max(1);
+        for i in 0..=count {
+            if i.is_multiple_of(4096) {
+                cancel.check()?;
+            }
+            let u = model[7] + (model[8] - model[7]) * i as f64 / count as f64;
+            let p = curve_point(model, u);
+            donor_points.push(p);
+            donor_colors.push(source_color(source, p));
+            donor_ids.push(owner);
+        }
+    }
+    for (i, &(p, owner)) in trace_donors.iter().enumerate() {
+        if i.is_multiple_of(4096) {
+            cancel.check()?;
+        }
+        donor_points.push(p);
+        donor_colors.push(source_color(source, p));
+        donor_ids.push(owner);
+    }
+    let donor_tree = Spatial::new(donor_points, 2.);
+    let mut points = Vec::new();
+    let mut colors = Vec::new();
+    let mut owners = Vec::new();
+    for (&curve, &owner) in curves.iter().zip(curve_owners) {
+        cancel.check()?;
+        let control_length = (curve[1][0] - curve[0][0]).hypot(curve[1][1] - curve[0][1])
+            + (curve[2][0] - curve[1][0]).hypot(curve[2][1] - curve[1][1]);
+        // Keep target samples closer than half a target pixel. This retains
+        // the existing two-pixel target donor search margin without attaching
+        // fitted geometry to an unrelated source contour.
+        let count = ((control_length * scale[0].max(scale[1]) / 0.35).ceil() as usize).max(2);
+        for i in 0..=count {
+            if i.is_multiple_of(4096) {
+                cancel.check()?;
+            }
+            let t = i as f64 / count as f64;
+            let mt = 1. - t;
+            let p = [
+                curve[0][0] * mt * mt + 2. * curve[1][0] * mt * t + curve[2][0] * t * t,
+                curve[0][1] * mt * mt + 2. * curve[1][1] * mt * t + curve[2][1] * t * t,
+            ];
+            let candidates: Vec<_> = donor_tree
+                .radius(p, 3.)
+                .into_iter()
+                .filter(|&id| donor_ids[id] == owner)
+                .collect();
+            let nearest_geometry = candidates.iter().copied().min_by(|&a, &b| {
+                distance2(p, donor_tree.points[a])
+                    .total_cmp(&distance2(p, donor_tree.points[b]))
+                    .then(a.cmp(&b))
+            });
+            // A fit can cross a sparsely detected stretch of an otherwise
+            // well-supported trace.  The spline itself belongs to `owner`, so
+            // sample its original source location rather than borrowing a
+            // nearby different contour.  This is also the safe alpha donor
+            // for foreground-only compositing.
+            let visible = candidates
+                .into_iter()
+                .filter(|&id| donor_colors[id].is_some())
+                .min_by(|&a, &b| {
+                    distance2(p, donor_tree.points[a])
+                        .total_cmp(&distance2(p, donor_tree.points[b]))
+                        .then(a.cmp(&b))
+                });
+            // Source geometry and source alpha are different facts. A
+            // transparent nearest donor is not source ink, but it also does
+            // not permit borrowing another contour's colour.
+            let color = nearest_geometry
+                .and(visible)
+                .and_then(|id| donor_colors[id]);
+            points.push(std::array::from_fn(|axis| {
+                (p[axis] + 0.5) * scale[axis] - 0.5
+            }));
+            colors.push(color);
+            owners.push(owner);
+        }
+    }
+    let spatial = Spatial::new(points, 2.);
+    let mut ink = vec![[0.; 3]; strokes.coverage.as_raw().len()];
+    let mut visible = vec![false; strokes.coverage.as_raw().len()];
+    for (i, alpha) in strokes.coverage.as_raw().iter().enumerate() {
+        if i.is_multiple_of(4096) {
+            cancel.check()?;
+        }
+        if *alpha == 0 {
+            continue;
+        }
+        let q = [
+            (i % strokes.coverage.width() as usize) as f64,
+            (i / strokes.coverage.width() as usize) as f64,
+        ];
+        let candidates = spatial.radius(q, 2.);
+        let Some(_) = candidates
+            .iter()
+            .copied()
+            .filter(|&id| Some(owners[id]) == strokes.owners[i])
+            .min_by(|&a, &b| {
+                distance2(q, spatial.points[a])
+                    .total_cmp(&distance2(q, spatial.points[b]))
+                    .then(a.cmp(&b))
+            })
+        else {
+            return Err(crate::Error::Scaling(format!(
+                "No fitted contour geometry for target pixel {i}"
+            )));
+        };
+        let nearest_visible = candidates
+            .into_iter()
+            .filter(|&id| Some(owners[id]) == strokes.owners[i] && colors[id].is_some())
+            .min_by(|&a, &b| {
+                distance2(q, spatial.points[a])
+                    .total_cmp(&distance2(q, spatial.points[b]))
+                    .then(a.cmp(&b))
+            });
+        if let Some(j) = nearest_visible {
+            let color = colors[j].expect("visible samples have color");
+            ink[i] = color;
+            visible[i] = true;
+        }
+    }
+    Ok((ink, visible))
+}
+
 pub fn composite(base: &LinearImage, ink: &[[f64; 3]], coverage: &GrayImage) -> RgbaImage {
     RgbaImage::from_fn(base.w as u32, base.h as u32, |x, y| {
         let i = y as usize * base.w + x as usize;
@@ -166,6 +321,24 @@ pub(crate) fn composite_pixel(base: [f64; 4], ink: [f64; 3], coverage: u8) -> im
 mod tests {
     use super::*;
     use crate::{opacity, strokes::Strokes};
+
+    fn owner_pixel(w: u32, h: u32, x: u32, y: u32, owner: usize) -> Strokes {
+        let mut core = GrayImage::new(w, h);
+        let mut coverage = GrayImage::new(w, h);
+        core.put_pixel(x, y, image::Luma([255]));
+        coverage.put_pixel(x, y, image::Luma([255]));
+        let mut owners = vec![None; (w * h) as usize];
+        owners[(y * w + x) as usize] = Some(owner);
+        Strokes {
+            core,
+            coverage,
+            owners,
+        }
+    }
+
+    fn point_model(x: f64, y: f64) -> Model {
+        [x, y, 0., 1., 0., 0., 0., 0., 0., 1.]
+    }
 
     #[test]
     fn closer_green_donor_cannot_repaint_owned_black_core() {
@@ -273,5 +446,105 @@ mod tests {
         )
         .unwrap();
         assert!(!visible[210], "unsupported foreground ink is suppressible");
+    }
+
+    #[test]
+    fn fitted_curve_uses_original_same_owner_donors_over_shifted_green_geometry() {
+        let source = LinearImage::from_rgba(&RgbaImage::from_fn(20, 20, |_, y| {
+            image::Rgba(if y == 8 {
+                [0, 0, 0, 255]
+            } else {
+                [60, 150, 30, 255]
+            })
+        }));
+        let black = [10., 8., 0., 1., 0., 0., 0., -8., 8., 1.];
+        let green = [10., 9., 0., 1., 0., 0., 0., -8., 8., 1.];
+        let curve = [[2., 9.], [10., 9.], [18., 9.]];
+        let strokes = owner_pixel(20, 20, 10, 9, 0);
+        let (colors, visible) = ink_colors_for_curves(
+            &source,
+            &[curve],
+            &[0],
+            &[black, green],
+            &[0, 1],
+            &[],
+            &strokes,
+            [1., 1.],
+            &CancellationToken::default(),
+        )
+        .unwrap();
+        assert!(visible[190]);
+        assert_eq!(colors[190], [0.; 3]);
+    }
+
+    #[test]
+    fn fitted_curve_can_color_a_sparse_stretch_from_its_original_trace() {
+        let mut image = RgbaImage::new(20, 20);
+        image.put_pixel(10, 10, image::Rgba([0, 0, 0, 255]));
+        let source = LinearImage::from_rgba(&image);
+        let curve = [[8., 10.], [10., 10.], [12., 10.]];
+        let strokes = owner_pixel(20, 20, 10, 10, 0);
+        let (colors, visible) = ink_colors_for_curves(
+            &source,
+            &[curve],
+            &[0],
+            &[],
+            &[],
+            &[([10., 10.], 0)],
+            &strokes,
+            [1., 1.],
+            &CancellationToken::default(),
+        )
+        .unwrap();
+        assert!(visible[210]);
+        assert_eq!(colors[210], [0.; 3]);
+    }
+
+    #[test]
+    fn transparent_nearest_curve_sample_does_not_hide_nearby_visible_same_owner_ink() {
+        let mut image = RgbaImage::new(30, 30);
+        image.put_pixel(10, 10, image::Rgba([0, 0, 0, 255]));
+        let source = LinearImage::from_rgba(&image);
+        let curve = [[10., 10.], [15., 10.], [20., 10.]];
+        let strokes = owner_pixel(4, 4, 1, 1, 0);
+        let (colors, visible) = ink_colors_for_curves(
+            &source,
+            &[curve],
+            &[0],
+            &[point_model(10., 10.), point_model(13.333_333, 10.)],
+            &[0, 0],
+            &[],
+            &strokes,
+            [0.1, 0.1],
+            &CancellationToken::default(),
+        )
+        .unwrap();
+        assert!(visible[5]);
+        assert_eq!(colors[5], [0.; 3]);
+    }
+
+    #[test]
+    fn fitted_curve_never_borrows_a_different_owner_donor() {
+        let source = LinearImage::from_rgba(&RgbaImage::from_pixel(
+            20,
+            20,
+            image::Rgba([60, 150, 30, 255]),
+        ));
+        let curve = [[8., 10.], [10., 10.], [12., 10.]];
+        let strokes = owner_pixel(20, 20, 10, 10, 0);
+        let (colors, visible) = ink_colors_for_curves(
+            &source,
+            &[curve],
+            &[0],
+            &[],
+            &[],
+            &[([10., 10.], 1)],
+            &strokes,
+            [1., 1.],
+            &CancellationToken::default(),
+        )
+        .unwrap();
+        assert!(!visible[210]);
+        assert_eq!(colors[210], [0.; 3]);
     }
 }
