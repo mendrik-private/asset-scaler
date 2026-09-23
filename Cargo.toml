@@ -1,6 +1,6 @@
 [package]
 name = "asset-scaler"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.92"
 description = "Contour-aware downscaling for game sprites and illustrated assets"
@@ -9,7 +9,17 @@ repository = "https://github.com/mendrik-private/asset-scaler"
 readme = "README.md"
 keywords = ["image", "resize", "sprites", "pixel-art", "gamedev"]
 categories = ["multimedia::images", "game-development"]
-include = ["src/**", "tests/**", "examples/**", "Cargo.toml", "Cargo.lock", "README.md", "LICENSE"]
+include = [
+    "src/**",
+    "tests/**",
+    "examples/resize.rs",
+    "docs/asset-scaler-server.md",
+    "docs/images/**",
+    "Cargo.toml",
+    "Cargo.lock",
+    "README.md",
+    "LICENSE",
+]
 
 [workspace]
 members = ["asset-background-removal", "asset-scaler-server"]

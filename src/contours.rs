@@ -9,7 +9,7 @@ use crate::{
 };
 use std::collections::HashSet;
 
-pub const MAX_SHORT_PIXELS: usize = 3;
+pub const MAX_SHORT_PIXELS: usize = 2;
 
 pub struct Contours {
     pub lengths: Vec<f64>,
@@ -369,5 +369,56 @@ impl Contours {
             }
         }
         Ok(mask)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Contours, MAX_SHORT_PIXELS};
+    use crate::{CancellationToken, raster::Mask};
+
+    #[test]
+    fn short_contours_drop_with_resolution_in_both_render_and_fill_paths() {
+        let contours = Contours {
+            // At 50% scale, source x=1..7 visits target x=0..3 (four
+            // pixels); x=9..13 visits x=4..6 (three pixels).
+            points: vec![[1., 1.], [7., 1.], [9., 1.], [13., 1.]],
+            paths: vec![vec![0, 1], vec![2, 3]],
+            lengths: vec![6., 4.],
+            assignments: vec![vec![0], vec![1]],
+            source_size: [16, 4],
+            bridges: Vec::new(),
+        };
+        let models = vec![[0.; 10], [1.; 10]];
+        let half = [0.5, 0.5];
+        assert_eq!(contours.pixel_counts(half), vec![4, 3]);
+        let (retained, owners) = contours.retain_with_ids(&models, half, MAX_SHORT_PIXELS);
+        assert_eq!(retained.len(), 2);
+        assert_eq!(owners, vec![0, 1]);
+
+        let mut footprint = Mask::new(16, 4);
+        for x in 1..=7 {
+            footprint.data[16 + x] = true;
+        }
+        for x in 9..=13 {
+            footprint.data[16 + x] = true;
+        }
+        let retained = contours
+            .retained_ink_mask(&footprint, half, &CancellationToken::default())
+            .unwrap();
+        assert!((1..=7).all(|x| retained.data[16 + x]));
+        assert!((9..=13).all(|x| retained.data[16 + x]));
+
+        // Both curves project to two pixels at 25%, so resolution removes
+        // their redraw and halo-mask membership.
+        let quarter = [0.25, 0.25];
+        assert_eq!(contours.pixel_counts(quarter), vec![2, 2]);
+        let (retained, owners) = contours.retain_with_ids(&models, quarter, MAX_SHORT_PIXELS);
+        assert!(retained.is_empty());
+        assert!(owners.is_empty());
+        let retained = contours
+            .retained_ink_mask(&footprint, quarter, &CancellationToken::default())
+            .unwrap();
+        assert!(retained.data.iter().all(|&on| !on));
     }
 }

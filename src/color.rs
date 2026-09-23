@@ -28,6 +28,10 @@ pub fn encode(v: f64) -> f64 {
         1.055 * v.powf(1. / 2.4) - 0.055
     }
 }
+/// Scale displayed sRGB channels while retaining linear storage.
+pub(crate) fn scale_srgb(color: [f64; 3], brightness: f64) -> [f64; 3] {
+    color.map(|channel| decode(encode(channel) * brightness))
+}
 pub fn rgba(p: [f64; 4]) -> Rgba<u8> {
     let a = (p[3].clamp(0., 1.) * 255.).round() as u8;
     if a == 0 {
@@ -76,6 +80,15 @@ mod tests {
                 assert_eq!(actual[c].to_bits(), decode(p[c] as f64 / 255.).to_bits());
             }
             assert_eq!(actual[3], p[3] as f64 / 255.);
+        }
+    }
+
+    #[test]
+    fn srgba_scaling_scales_displayed_channels_not_linear_energy() {
+        let original = [decode(0.8), decode(0.25), decode(0.04)];
+        let darkened = scale_srgb(original, 0.8);
+        for channel in 0..3 {
+            assert!((encode(darkened[channel]) - encode(original[channel]) * 0.8).abs() < 1e-12);
         }
     }
 }

@@ -59,11 +59,68 @@ fn off_grid_line_remains_connected() {
         &CancellationToken::default(),
     )
     .unwrap();
-    let darkest: Vec<_> = (0..8)
-        .map(|y| (3..6).map(|x| output.get_pixel(x, y)[0]).min().unwrap())
+    let preserved: Vec<_> = (0..8)
+        .map(|y| {
+            (3..6).any(|x| {
+                let pixel = output.get_pixel(x, y);
+                pixel[3] > 0 && pixel[0] < 224
+            })
+        })
         .collect();
     assert!(
-        darkest.iter().all(|&value| value < 224),
-        "clipped line rows: {darkest:?}"
+        preserved.iter().all(|&value| value),
+        "clipped line rows: {preserved:?}"
     );
+}
+
+#[test]
+fn opaque_flat_canvas_becomes_transparent_without_eroding_its_foreground() {
+    // Keep the image bright enough that edge detection does not manufacture an
+    // ink contour: this exercises source-support topology itself.  Each target
+    // support cell is fully covered by the 4×4 source footprint.
+    let source = RgbaImage::from_fn(64, 64, |x, y| {
+        if (20..44).contains(&x) && (20..44).contains(&y) {
+            Rgba([200, 200, 200, 255])
+        } else {
+            Rgba([250, 250, 250, 255])
+        }
+    });
+    for aa in [0, 20, 50, 100] {
+        let output = resize(
+            &source,
+            16,
+            16,
+            GameAssetAa::new(aa),
+            &CancellationToken::default(),
+        )
+        .unwrap();
+        for y in 5..11 {
+            for x in 5..11 {
+                assert_eq!(
+                    output.get_pixel(x, y)[3],
+                    255,
+                    "AA {aa}: full source support was erased at ({x}, {y})"
+                );
+            }
+        }
+        assert_eq!(
+            output.get_pixel(4, 7),
+            &Rgba([0; 4]),
+            "AA {aa}: flat canvas exterior remained visible"
+        );
+    }
+}
+
+#[test]
+fn uniform_opaque_canvas_becomes_empty_when_downscaled() {
+    let source = RgbaImage::from_pixel(32, 32, Rgba([80, 120, 160, 255]));
+    let output = resize(
+        &source,
+        16,
+        16,
+        GameAssetAa::new(20),
+        &CancellationToken::default(),
+    )
+    .unwrap();
+    assert!(output.pixels().all(|pixel| pixel.0 == [0; 4]));
 }

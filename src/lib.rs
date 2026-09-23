@@ -16,6 +16,7 @@ mod contours;
 mod coverage;
 mod detect;
 mod field;
+mod foreground_halo;
 mod halo;
 mod ink;
 mod lanczos;
@@ -26,6 +27,7 @@ mod silhouette;
 mod smoothing;
 mod source;
 mod strokes;
+mod target_cleanup;
 #[cfg(test)]
 mod tests;
 pub const DEFAULT_MEMORY_LIMIT: u64 = 4 * 1024 * 1024 * 1024;
@@ -37,6 +39,48 @@ pub const DEFAULT_MEMORY_LIMIT: u64 = 4 * 1024 * 1024 * 1024;
 // four GiB, independently of the decoder and canvas safety limits.
 const SOURCE_PHASE_BYTES: u64 = 512;
 const TARGET_PHASE_BYTES: u64 = 160;
+const FOREGROUND_SOURCE_BYTES: u64 = 96;
+
+/// Colour to use when painting contours over an externally prepared fill.
+///
+/// `OriginalInk` samples the ink from the unedited source.  `DarkenedFill`
+/// samples the already-downscaled fill at the contour pixel and multiplies its
+/// linear-light RGB channels by `luminance`.  This deliberately leaves alpha
+/// to the normal contour compositor.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum OutlineColor {
+    OriginalInk,
+    DarkenedFill { luminance: f64 },
+}
+
+/// Controls how ordinary resize calls treat a flat, opaque source canvas.
+///
+/// The default keeps the established behavior: boundary-connected pixels that
+/// match a flat opaque canvas become transparent.  Select
+/// [`Self::preserve_opaque_background`] when the source is a complete opaque
+/// image, such as a game backdrop.  Source alpha is always respected.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ResizeOptions {
+    remove_opaque_background: bool,
+}
+
+impl ResizeOptions {
+    /// Preserve a flat opaque source canvas during resize.
+    #[must_use]
+    pub const fn preserve_opaque_background() -> Self {
+        Self {
+            remove_opaque_background: false,
+        }
+    }
+}
+
+impl Default for ResizeOptions {
+    fn default() -> Self {
+        Self {
+            remove_opaque_background: true,
+        }
+    }
+}
 
 fn working_set_estimate(sw: u32, sh: u32, w: u32, h: u32) -> u64 {
     u64::from(sw)
@@ -55,6 +99,18 @@ fn check_working_set_budget(sw: u32, sh: u32, w: u32, h: u32, limit: u64) -> Res
     }
     Ok(())
 }
+
+fn check_foreground_working_set_budget(sw: u32, sh: u32, w: u32, h: u32, limit: u64) -> Result<()> {
+    let estimate = working_set_estimate(sw, sh, w, h).saturating_add(
+        u64::from(sw)
+            .saturating_mul(u64::from(sh))
+            .saturating_mul(FOREGROUND_SOURCE_BYTES),
+    );
+    if estimate > limit {
+        return Err(Error::GameAssetMemoryLimit { limit_bytes: limit });
+    }
+    Ok(())
+}
 struct Prepared {
     models: Vec<detect::Model>,
     widths: Vec<f64>,
@@ -62,13 +118,48 @@ struct Prepared {
     mask: raster::Mask,
     linear: color::LinearImage,
     silhouette: Option<silhouette::Silhouette>,
+    original_is_opaque: bool,
 }
 struct TargetContours {
     strokes: strokes::Strokes,
     colors: Vec<[f64; 3]>,
 }
+struct InkSource<'a> {
+    linear: &'a color::LinearImage,
+    suppress_unsupported: bool,
+    brightness: Option<f64>,
+}
+struct ForegroundInkResize {
+    w: u32,
+    h: u32,
+    aa: GameAssetAa,
+    brightness: f64,
+}
+struct FinishedFill {
+    linear: color::LinearImage,
+    foreground_support: Option<Vec<bool>>,
+}
+struct FillTarget {
+    target: (u32, u32),
+    aa: GameAssetAa,
+    foreground_support: bool,
+}
+struct FillResize {
+    w: u32,
+    h: u32,
+    aa: GameAssetAa,
+    outline_color: OutlineColor,
+}
 impl Prepared {
     fn new(image: &RgbaImage, cancel: &dyn Cancellation) -> Result<Self> {
+        Self::with_options(image, ResizeOptions::default(), cancel)
+    }
+
+    fn with_options(
+        image: &RgbaImage,
+        options: ResizeOptions,
+        cancel: &dyn Cancellation,
+    ) -> Result<Self> {
         cancel.check()?;
         let samples = detect::detect(image, cancel)?;
         cancel.check()?;
@@ -86,7 +177,18 @@ impl Prepared {
         cancel.check()?;
         let widths = opacity::widths(image, &mask, &samples, &contours, cancel)?;
         let linear = color::LinearImage::from_rgba(image);
-        let silhouette = silhouette::Silhouette::detect(image, cancel)?;
+        let mut original_is_opaque = true;
+        for (i, pixel) in image.pixels().enumerate() {
+            if i.is_multiple_of(4096) {
+                cancel.check()?;
+            }
+            original_is_opaque &= pixel[3] == 255;
+        }
+        let silhouette = silhouette::Silhouette::detect_with_opaque_background_removal(
+            image,
+            options.remove_opaque_background,
+            cancel,
+        )?;
         Ok(Self {
             models,
             widths,
@@ -94,6 +196,7 @@ impl Prepared {
             mask,
             linear,
             silhouette,
+            original_is_opaque,
         })
     }
     fn target_contours(
@@ -104,13 +207,45 @@ impl Prepared {
         aa: GameAssetAa,
         cancel: &dyn Cancellation,
     ) -> Result<TargetContours> {
+        self.target_contours_with_ink_source(
+            image,
+            w,
+            h,
+            aa,
+            InkSource {
+                linear: &self.linear,
+                suppress_unsupported: false,
+                brightness: None,
+            },
+            cancel,
+        )
+    }
+
+    /// Keep original contour geometry while optionally coloring it from an
+    /// aligned foreground. This remains private because ordinary resize calls
+    /// must retain their established original-ink behavior.
+    fn target_contours_with_ink_source(
+        &self,
+        image: &RgbaImage,
+        w: u32,
+        h: u32,
+        aa: GameAssetAa,
+        ink_source: InkSource<'_>,
+        cancel: &dyn Cancellation,
+    ) -> Result<TargetContours> {
         let scale = [
             w as f64 / image.width() as f64,
             h as f64 / image.height() as f64,
         ];
-        let (retained, owners) =
-            self.contours
-                .retain_with_ids(&self.models, scale, contours::MAX_SHORT_PIXELS);
+        // The foreground compositor coalesces at target resolution, so it
+        // must keep every nonempty source fragment until that final cutoff.
+        // Ordinary resize retains its established source-resolution cutoff.
+        let cutoff = if ink_source.suppress_unsupported {
+            0
+        } else {
+            contours::MAX_SHORT_PIXELS
+        };
+        let (retained, owners) = self.contours.retain_with_ids(&self.models, scale, cutoff);
         let smoothed = smoothing::smooth(&retained, scale[0].min(scale[1]), cancel)?;
         let curves: Vec<_> = smoothed
             .iter()
@@ -120,36 +255,125 @@ impl Prepared {
             })
             .collect();
         cancel.check()?;
-        let strokes = strokes::render(&curves, &owners, &self.widths, w, h, aa, cancel)?;
-        let colors = paint::ink_colors(
-            &self.linear,
-            &retained,
-            &smoothed,
-            &owners,
-            &strokes,
-            scale,
-            cancel,
-        )?;
+        let mut strokes = strokes::render(&curves, &owners, &self.widths, w, h, aa, cancel)?;
+        let (mut colors, visible) = if ink_source.suppress_unsupported {
+            paint::ink_colors_with_visibility(
+                ink_source.linear,
+                &retained,
+                &smoothed,
+                &owners,
+                &strokes,
+                scale,
+                cancel,
+            )?
+        } else {
+            (
+                paint::ink_colors(
+                    ink_source.linear,
+                    &retained,
+                    &smoothed,
+                    &owners,
+                    &strokes,
+                    scale,
+                    cancel,
+                )?,
+                vec![true; strokes.coverage.as_raw().len()],
+            )
+        };
+        if ink_source.suppress_unsupported {
+            for (i, &supported) in visible.iter().enumerate() {
+                if i.is_multiple_of(4096) {
+                    cancel.check()?;
+                }
+                if supported {
+                    continue;
+                }
+                strokes.coverage.as_mut()[i] = 0;
+                strokes.core.as_mut()[i] = 0;
+                strokes.owners[i] = None;
+            }
+        }
+        if let Some(brightness) = ink_source.brightness {
+            for (i, ink_color) in colors.iter_mut().enumerate() {
+                if i.is_multiple_of(4096) {
+                    cancel.check()?;
+                }
+                *ink_color = color::scale_srgb(*ink_color, brightness);
+            }
+        }
         Ok(TargetContours { strokes, colors })
     }
-    fn resize(
+    fn resize_with_fill(
         &self,
-        image: &RgbaImage,
-        w: u32,
-        h: u32,
+        contour_source: &RgbaImage,
+        fill_linear: &color::LinearImage,
+        fill_silhouette: Option<&silhouette::Silhouette>,
+        target: (u32, u32),
         aa: GameAssetAa,
         cancel: &dyn Cancellation,
     ) -> Result<RgbaImage> {
-        let TargetContours { strokes, colors } = self.target_contours(image, w, h, aa, cancel)?;
+        let (w, h) = target;
+        let contours = self.target_contours(contour_source, w, h, aa, cancel)?;
+        self.resize_with_fill_from_target(
+            fill_linear,
+            fill_silhouette,
+            contours,
+            target,
+            aa,
+            cancel,
+        )
+    }
+
+    /// Shared fill, silhouette, halo and compositor path after contour colors
+    /// have been selected.
+    fn resize_with_fill_from_target(
+        &self,
+        fill_linear: &color::LinearImage,
+        fill_silhouette: Option<&silhouette::Silhouette>,
+        TargetContours { strokes, colors }: TargetContours,
+        target: (u32, u32),
+        aa: GameAssetAa,
+        cancel: &dyn Cancellation,
+    ) -> Result<RgbaImage> {
         let strength = opacity::calculate(&self.widths, &strokes.core, &strokes.owners);
         let paint = opacity::apply(&strokes.coverage, &strokes.owners, &strength);
+        let fill = self
+            .fill_for_target(
+                fill_linear,
+                fill_silhouette,
+                &strokes,
+                FillTarget {
+                    target,
+                    aa,
+                    foreground_support: false,
+                },
+                cancel,
+            )?
+            .linear;
+        let result = paint::composite(&fill, &colors, &paint);
+        cancel.check()?;
+        Ok(result)
+    }
+
+    /// Produce the finished fill once, including ordinary halo and silhouette
+    /// work. The foreground compositor uses this support to canonicalize its
+    /// target contour core before painting.
+    fn fill_for_target(
+        &self,
+        fill_linear: &color::LinearImage,
+        fill_silhouette: Option<&silhouette::Silhouette>,
+        strokes: &strokes::Strokes,
+        request: FillTarget,
+        cancel: &dyn Cancellation,
+    ) -> Result<FinishedFill> {
+        let (w, h) = request.target;
         let scale = [
-            w as f64 / image.width() as f64,
-            h as f64 / image.height() as f64,
+            w as f64 / self.linear.w as f64,
+            h as f64 / self.linear.h as f64,
         ];
         let mut retained_mask = self.contours.retained_ink_mask(&self.mask, scale, cancel)?;
         cancel.check()?;
-        let isolated = if let Some(silhouette) = &self.silhouette {
+        let isolated = if let Some(silhouette) = fill_silhouette {
             for (i, (masked, &supported)) in retained_mask
                 .data
                 .iter_mut()
@@ -161,24 +385,28 @@ impl Prepared {
                 }
                 *masked &= supported;
             }
-            Some(silhouette.isolated(&self.linear, cancel)?)
+            Some(silhouette.isolated(fill_linear, cancel)?)
         } else {
             None
         };
-        let fill_source = isolated.as_ref().unwrap_or(&self.linear);
+        let fill_source = isolated.as_ref().unwrap_or(fill_linear);
         let base = lanczos::resize(fill_source, w as usize, h as usize, cancel)?;
+        let target_support = if request.foreground_support {
+            let mut support = Vec::with_capacity(base.pixels.len());
+            for (i, pixel) in base.pixels.iter().enumerate() {
+                if i.is_multiple_of(4096) {
+                    cancel.check()?;
+                }
+                support.push(pixel[3] >= 0.5);
+            }
+            Some(support)
+        } else {
+            None
+        };
         let base = halo::apply(fill_source, &retained_mask, base, &strokes.core, cancel)?;
-        let fill = if let Some(silhouette) = &self.silhouette {
+        let fill = if let Some(silhouette) = fill_silhouette {
             let source_coverage = silhouette.coverage(w as usize, h as usize, cancel)?;
-            let retained_coverage =
-                silhouette.project_mask(&retained_mask, w as usize, h as usize, cancel)?;
-            let coverage = silhouette.target_coverage(
-                &source_coverage,
-                &retained_coverage,
-                &strokes.core,
-                aa,
-                cancel,
-            )?;
+            let coverage = silhouette.target_coverage(&source_coverage, request.aa, cancel)?;
             let opacity = silhouette.intrinsic_opacity(
                 fill_source,
                 &source_coverage,
@@ -186,7 +414,6 @@ impl Prepared {
                 h as usize,
                 cancel,
             )?;
-            let exterior = silhouette.exterior();
             let mut pixels = Vec::with_capacity(base.pixels.len());
             for (i, ((pixel, support), intrinsic)) in
                 base.pixels.iter().zip(coverage).zip(opacity).enumerate()
@@ -195,16 +422,10 @@ impl Prepared {
                     cancel.check()?;
                 }
                 let alpha = (intrinsic * support).clamp(0., 1.);
-                let out_alpha = alpha + exterior[3] * (1. - alpha);
-                pixels.push(if out_alpha <= 1e-8 {
+                pixels.push(if alpha <= 1e-8 {
                     [0.; 4]
                 } else {
-                    [
-                        (pixel[0] * alpha + exterior[0] * exterior[3] * (1. - alpha)) / out_alpha,
-                        (pixel[1] * alpha + exterior[1] * exterior[3] * (1. - alpha)) / out_alpha,
-                        (pixel[2] * alpha + exterior[2] * exterior[3] * (1. - alpha)) / out_alpha,
-                        out_alpha,
-                    ]
+                    [pixel[0], pixel[1], pixel[2], alpha]
                 });
             }
             color::LinearImage {
@@ -215,9 +436,283 @@ impl Prepared {
         } else {
             base
         };
-        let result = paint::composite(&fill, &colors, &paint);
+        Ok(FinishedFill {
+            linear: fill,
+            foreground_support: target_support,
+        })
+    }
+
+    fn resize(
+        &self,
+        image: &RgbaImage,
+        w: u32,
+        h: u32,
+        aa: GameAssetAa,
+        cancel: &dyn Cancellation,
+    ) -> Result<RgbaImage> {
+        self.resize_with_fill(
+            image,
+            &self.linear,
+            self.silhouette.as_ref(),
+            (w, h),
+            aa,
+            cancel,
+        )
+    }
+
+    fn resize_with_foreground(
+        &self,
+        original: &RgbaImage,
+        foreground: &RgbaImage,
+        w: u32,
+        h: u32,
+        aa: GameAssetAa,
+        cancel: &dyn Cancellation,
+    ) -> Result<RgbaImage> {
+        let fill_linear = color::LinearImage::from_rgba(foreground);
+        let fill_silhouette = silhouette::Silhouette::detect(foreground, cancel)?;
+        self.resize_with_fill(
+            original,
+            &fill_linear,
+            fill_silhouette.as_ref(),
+            (w, h),
+            aa,
+            cancel,
+        )
+    }
+
+    fn resize_with_foreground_ink(
+        &self,
+        original: &RgbaImage,
+        foreground: &RgbaImage,
+        request: ForegroundInkResize,
+        cancel: &dyn Cancellation,
+    ) -> Result<RgbaImage> {
+        let fill_linear = color::LinearImage::from_rgba(foreground);
+        let fill_silhouette = silhouette::Silhouette::detect(foreground, cancel)?;
+        let contours = self.target_contours_with_ink_source(
+            original,
+            request.w,
+            request.h,
+            request.aa,
+            InkSource {
+                linear: &fill_linear,
+                suppress_unsupported: true,
+                brightness: Some(request.brightness),
+            },
+            cancel,
+        )?;
+        self.resize_with_fill_from_target_and_canonical_core(
+            &fill_linear,
+            fill_silhouette.as_ref(),
+            contours,
+            (request.w, request.h),
+            request.aa,
+            cancel,
+        )
+    }
+
+    /// The foreground-ink-only compositor path reduces all rendered target
+    /// cores to one canonical, outer-prioritized mask before painting them.
+    fn resize_with_fill_from_target_and_canonical_core(
+        &self,
+        fill_linear: &color::LinearImage,
+        fill_silhouette: Option<&silhouette::Silhouette>,
+        mut contours: TargetContours,
+        target: (u32, u32),
+        aa: GameAssetAa,
+        cancel: &dyn Cancellation,
+    ) -> Result<RgbaImage> {
+        let fill = self.fill_for_target(
+            fill_linear,
+            fill_silhouette,
+            &contours.strokes,
+            FillTarget {
+                target,
+                aa,
+                foreground_support: true,
+            },
+            cancel,
+        )?;
+        let support = fill
+            .foreground_support
+            .as_deref()
+            .expect("foreground support was requested");
+        Self::canonicalize_foreground_strokes(
+            &mut contours.strokes,
+            &mut contours.colors,
+            support,
+            aa,
+            cancel,
+        )?;
+        let strength = self.foreground_ink_strengths(&contours.strokes, aa);
+        let paint = opacity::apply(
+            &contours.strokes.coverage,
+            &contours.strokes.owners,
+            &strength,
+        );
+        let baseline = paint::composite(&fill.linear, &contours.colors, &paint);
+        foreground_halo::clean(
+            foreground_halo::Inputs {
+                support,
+                original_is_opaque: self.original_is_opaque,
+                fill: &fill.linear,
+                baseline,
+                core: &contours.strokes.core,
+                coverage: &contours.strokes.coverage,
+                owners: &contours.strokes.owners,
+                colors: &contours.colors,
+            },
+            cancel,
+        )
+    }
+
+    /// Convert all target contour owners into one exterior-prioritized core.
+    /// Removed cores cannot retain full AA coverage; a bounded fringe may only
+    /// borrow the nearest surviving canonical core's owner and colour.
+    fn canonicalize_foreground_strokes(
+        strokes: &mut strokes::Strokes,
+        colors: &mut [[f64; 3]],
+        support: &[bool],
+        aa: GameAssetAa,
+        cancel: &dyn Cancellation,
+    ) -> Result<()> {
+        let raw = raster::Mask {
+            w: strokes.core.width() as usize,
+            h: strokes.core.height() as usize,
+            data: strokes
+                .core
+                .as_raw()
+                .iter()
+                .map(|&value| value != 0)
+                .collect(),
+        };
+        if colors.len() != raw.data.len() || strokes.owners.len() != raw.data.len() {
+            return Err(Error::Scaling(
+                "Invalid foreground contour ownership".into(),
+            ));
+        }
+        let canonical = target_cleanup::thin_outer(&raw, support, cancel)?;
+        let previous_coverage = strokes.coverage.as_raw().to_vec();
+        let previous_owners = strokes.owners.clone();
+        for (i, &keep) in canonical.data.iter().enumerate() {
+            if i.is_multiple_of(4096) {
+                cancel.check()?;
+            }
+            if raw.data[i] && !keep {
+                strokes.core.as_mut()[i] = 0;
+            }
+        }
+        for i in 0..raw.data.len() {
+            if i.is_multiple_of(4096) {
+                cancel.check()?;
+            }
+            if !canonical.data[i] {
+                strokes.coverage.as_mut()[i] = 0;
+                strokes.owners[i] = None;
+            }
+        }
+        if aa.percent() == 0 {
+            return Ok(());
+        }
+        let fringe_cap = (85 * u16::from(aa.percent()) / 100) as u8;
+        for (i, &old_coverage) in previous_coverage.iter().enumerate() {
+            if i.is_multiple_of(4096) {
+                cancel.check()?;
+            }
+            if canonical.data[i] || old_coverage == 0 {
+                continue;
+            }
+            let x = i % raw.w;
+            let y = i / raw.w;
+            let donor = (-1isize..=1)
+                .flat_map(|dy| (-1isize..=1).map(move |dx| (dx, dy)))
+                .filter(|&(dx, dy)| dx != 0 || dy != 0)
+                .filter_map(|(dx, dy)| {
+                    let xx = x as isize + dx;
+                    let yy = y as isize + dy;
+                    (xx >= 0 && yy >= 0 && xx < raw.w as isize && yy < raw.h as isize)
+                        .then(|| yy as usize * raw.w + xx as usize)
+                })
+                .filter(|&j| canonical.data[j] && previous_owners[j].is_some())
+                .min_by_key(|&j| {
+                    let dx = j % raw.w;
+                    let dy = j / raw.w;
+                    let ddx = dx.abs_diff(x);
+                    let ddy = dy.abs_diff(y);
+                    (ddx * ddx + ddy * ddy, j)
+                });
+            if let Some(j) = donor {
+                strokes.coverage.as_mut()[i] = old_coverage.min(fringe_cap);
+                strokes.owners[i] = previous_owners[j];
+                colors[i] = colors[j];
+            }
+        }
+        Ok(())
+    }
+
+    /// Foreground ink deliberately hardens its own core as antialiasing is
+    /// reduced. The intrinsic contour strength remains the AA100 endpoint.
+    fn foreground_ink_strengths(&self, strokes: &strokes::Strokes, aa: GameAssetAa) -> Vec<f64> {
+        let intrinsic = opacity::calculate(&self.widths, &strokes.core, &strokes.owners);
+        if aa.percent() == 100 {
+            return intrinsic;
+        }
+        let fraction = f64::from(aa.percent()) / 100.;
+        intrinsic
+            .into_iter()
+            .map(|strength| 1. - fraction * (1. - strength))
+            .collect()
+    }
+
+    fn resize_over_fill(
+        &self,
+        original: &RgbaImage,
+        fill_source: &RgbaImage,
+        request: FillResize,
+        cancel: &dyn Cancellation,
+    ) -> Result<RgbaImage> {
+        let TargetContours { strokes, colors } =
+            self.target_contours(original, request.w, request.h, request.aa, cancel)?;
+        let strength = opacity::calculate(&self.widths, &strokes.core, &strokes.owners);
+        let paint = opacity::apply(&strokes.coverage, &strokes.owners, &strength);
+        let fill_source = color::LinearImage::from_rgba(fill_source);
+        let base = lanczos::resize(&fill_source, request.w as usize, request.h as usize, cancel)?;
+        let fill = if let Some(silhouette) = &self.silhouette {
+            let source_coverage =
+                silhouette.coverage(request.w as usize, request.h as usize, cancel)?;
+            let coverage = silhouette.target_coverage(&source_coverage, request.aa, cancel)?;
+            let mut pixels = Vec::with_capacity(base.pixels.len());
+            for (i, (pixel, &support)) in base.pixels.iter().zip(&coverage).enumerate() {
+                if i % 4096 == 0 {
+                    cancel.check()?;
+                }
+                pixels.push([pixel[0], pixel[1], pixel[2], pixel[3] * support]);
+            }
+            color::LinearImage {
+                w: request.w as usize,
+                h: request.h as usize,
+                pixels,
+            }
+        } else {
+            base
+        };
+        let colors = match request.outline_color {
+            OutlineColor::OriginalInk => colors,
+            OutlineColor::DarkenedFill { luminance } => {
+                let luminance = if luminance.is_finite() {
+                    luminance.clamp(0., 1.)
+                } else {
+                    0.
+                };
+                fill.pixels
+                    .iter()
+                    .map(|p| [p[0] * luminance, p[1] * luminance, p[2] * luminance])
+                    .collect()
+            }
+        };
         cancel.check()?;
-        Ok(result)
+        Ok(paint::composite(&fill, &colors, &paint))
     }
 }
 #[derive(Default)]
@@ -231,18 +726,70 @@ pub struct Session {
     source: Arc<RgbaImage>,
     cache: Mutex<Cache>,
     memory_limit: u64,
+    options: ResizeOptions,
 }
 impl Session {
     pub fn new(source: Arc<RgbaImage>) -> Self {
-        Self::with_memory_limit(source, DEFAULT_MEMORY_LIMIT)
+        Self::with_options(source, ResizeOptions::default())
     }
+
+    /// Create a cached session with the selected resize behavior.
+    #[must_use]
+    pub fn with_options(source: Arc<RgbaImage>, options: ResizeOptions) -> Self {
+        Self::with_memory_limit_and_options(source, DEFAULT_MEMORY_LIMIT, options)
+    }
+
     /// Create a cached session with a caller-selected working-memory limit.
     pub fn with_memory_limit(source: Arc<RgbaImage>, memory_limit: u64) -> Self {
+        Self::with_memory_limit_and_options(source, memory_limit, ResizeOptions::default())
+    }
+
+    /// Create a cached session with a caller-selected memory limit and resize
+    /// behavior.
+    #[must_use]
+    pub fn with_memory_limit_and_options(
+        source: Arc<RgbaImage>,
+        memory_limit: u64,
+        options: ResizeOptions,
+    ) -> Self {
         Self {
             source,
             memory_limit,
+            options,
             cache: Mutex::new(Cache::default()),
         }
+    }
+
+    fn prepared(&self, cancel: &dyn Cancellation) -> Result<Arc<Prepared>> {
+        if let Some(prepared) = self
+            .cache
+            .lock()
+            .expect("Game Asset cache poisoned")
+            .prepared
+            .clone()
+        {
+            return Ok(prepared);
+        }
+        let prepared = Arc::new(Prepared::with_options(&self.source, self.options, cancel)?);
+        cancel.check()?;
+        self.cache
+            .lock()
+            .expect("Game Asset cache poisoned")
+            .prepared = Some(prepared.clone());
+        Ok(prepared)
+    }
+
+    /// Analyze the original artwork before an external background remover
+    /// changes its alpha or colours.
+    pub fn prepare(&self, cancel: &dyn Cancellation) -> Result<()> {
+        cancel.check()?;
+        let (sw, sh) = self.source.dimensions();
+        if sw == 0 || sh == 0 {
+            return Err(Error::InvalidDimensions);
+        }
+        check_working_set_budget(sw, sh, 1, 1, self.memory_limit)?;
+        self.prepared(cancel)?;
+        cancel.check()
     }
     pub fn resize(
         &self,
@@ -260,7 +807,7 @@ impl Session {
             return Ok((*self.source).clone());
         }
         check_working_set_budget(sw, sh, w, h, self.memory_limit)?;
-        let prepared = {
+        let cached = {
             let cache = self.cache.lock().expect("Game Asset cache poisoned");
             if let Some((key, result)) = &cache.target
                 && *key == (w, h, aa)
@@ -269,22 +816,95 @@ impl Session {
             }
             cache.prepared.clone()
         };
-        let prepared = match prepared {
-            Some(p) => p,
-            None => {
-                let p = Arc::new(Prepared::new(&self.source, cancel)?);
-                cancel.check()?;
-                self.cache
-                    .lock()
-                    .expect("Game Asset cache poisoned")
-                    .prepared = Some(p.clone());
-                p
-            }
-        };
+        let prepared = cached.map(Ok).unwrap_or_else(|| self.prepared(cancel))?;
         let result = prepared.resize(&self.source, w, h, aa, cancel)?;
         cancel.check()?;
         self.cache.lock().expect("Game Asset cache poisoned").target =
             Some(((w, h, aa), Arc::new(result.clone())));
+        Ok(result)
+    }
+
+    /// Resize a background-removed foreground while retaining contours and
+    /// source-width ink measured from the original session artwork.
+    pub fn resize_with_foreground(
+        &self,
+        foreground: &RgbaImage,
+        w: u32,
+        h: u32,
+        aa: GameAssetAa,
+        cancel: &dyn Cancellation,
+    ) -> Result<RgbaImage> {
+        cancel.check()?;
+        let (sw, sh) = self.source.dimensions();
+        if foreground.dimensions() != (sw, sh)
+            || w == 0
+            || h == 0
+            || sw == 0
+            || sh == 0
+            || w > sw
+            || h > sh
+        {
+            return Err(Error::InvalidDimensions);
+        }
+        if (w, h) == (sw, sh) {
+            return Ok(foreground.clone());
+        }
+        check_foreground_working_set_budget(sw, sh, w, h, self.memory_limit)?;
+        let prepared = self.prepared(cancel)?;
+        let result = prepared.resize_with_foreground(&self.source, foreground, w, h, aa, cancel)?;
+        cancel.check()?;
+        Ok(result)
+    }
+
+    /// Resize an aligned extracted foreground using its visible colours for
+    /// original-geometry ink, while leaving the resampled fill unchanged.
+    ///
+    /// `brightness` scales only contour RGB in displayed sRGB space and must
+    /// be finite in the inclusive range `0.0..=1.0`. Foreground pixels with
+    /// no alpha-supported donor suppress their corresponding contour pixels.
+    pub fn resize_with_foreground_ink(
+        &self,
+        foreground: &RgbaImage,
+        w: u32,
+        h: u32,
+        aa: GameAssetAa,
+        brightness: f64,
+        cancel: &dyn Cancellation,
+    ) -> Result<RgbaImage> {
+        cancel.check()?;
+        if !brightness.is_finite() || !(0.0..=1.0).contains(&brightness) {
+            return Err(Error::Scaling(
+                "foreground ink brightness must be finite and within 0.0..=1.0".into(),
+            ));
+        }
+        let (sw, sh) = self.source.dimensions();
+        if foreground.dimensions() != (sw, sh)
+            || w == 0
+            || h == 0
+            || sw == 0
+            || sh == 0
+            || w > sw
+            || h > sh
+        {
+            return Err(Error::InvalidDimensions);
+        }
+        if (w, h) == (sw, sh) {
+            return Ok(foreground.clone());
+        }
+        check_foreground_working_set_budget(sw, sh, w, h, self.memory_limit)?;
+        let prepared = self.prepared(cancel)?;
+        let result = prepared.resize_with_foreground_ink(
+            &self.source,
+            foreground,
+            ForegroundInkResize {
+                w,
+                h,
+                aa,
+                brightness,
+            },
+            cancel,
+        )?;
+        cancel.check()?;
         Ok(result)
     }
 }
@@ -297,7 +917,27 @@ pub fn resize(
     aa: GameAssetAa,
     cancel: &dyn Cancellation,
 ) -> Result<RgbaImage> {
-    resize_with_memory_limit(image, width, height, aa, cancel, DEFAULT_MEMORY_LIMIT)
+    resize_with_options(image, width, height, aa, cancel, ResizeOptions::default())
+}
+
+/// Reduce a borrowed image once with the selected resize behavior.
+pub fn resize_with_options(
+    image: &RgbaImage,
+    width: u32,
+    height: u32,
+    aa: GameAssetAa,
+    cancel: &dyn Cancellation,
+    options: ResizeOptions,
+) -> Result<RgbaImage> {
+    resize_with_memory_limit_and_options(
+        image,
+        width,
+        height,
+        aa,
+        cancel,
+        DEFAULT_MEMORY_LIMIT,
+        options,
+    )
 }
 
 /// Single-shot reduction with a caller-selected working-memory budget.
@@ -309,6 +949,28 @@ pub fn resize_with_memory_limit(
     cancel: &dyn Cancellation,
     memory_limit: u64,
 ) -> Result<RgbaImage> {
+    resize_with_memory_limit_and_options(
+        image,
+        width,
+        height,
+        aa,
+        cancel,
+        memory_limit,
+        ResizeOptions::default(),
+    )
+}
+
+/// Single-shot reduction with a caller-selected working-memory budget and
+/// resize behavior.
+pub fn resize_with_memory_limit_and_options(
+    image: &RgbaImage,
+    width: u32,
+    height: u32,
+    aa: GameAssetAa,
+    cancel: &dyn Cancellation,
+    memory_limit: u64,
+    options: ResizeOptions,
+) -> Result<RgbaImage> {
     cancel.check()?;
     let (sw, sh) = image.dimensions();
     if sw == 0 || sh == 0 || width == 0 || height == 0 || width > sw || height > sh {
@@ -318,8 +980,46 @@ pub fn resize_with_memory_limit(
         return Ok(image.clone());
     }
     check_working_set_budget(sw, sh, width, height, memory_limit)?;
-    let prepared = Prepared::new(image, cancel)?;
+    let prepared = Prepared::with_options(image, options, cancel)?;
     let output = prepared.resize(image, width, height, aa, cancel)?;
     cancel.check()?;
     Ok(output)
+}
+
+/// Downscale an externally generated, outline-free fill while tracing contours
+/// from `original` and repainting them on top.
+///
+/// The two sources must have identical dimensions.  This keeps Qwen or another
+/// editor's colour-only result aligned with contours traced from the untouched
+/// artwork.  The fill itself is resampled in linear light with Lanczos3.
+pub fn resize_with_outline_free_fill(
+    original: &RgbaImage,
+    outline_free_fill: &RgbaImage,
+    width: u32,
+    height: u32,
+    aa: GameAssetAa,
+    outline_color: OutlineColor,
+    cancel: &dyn Cancellation,
+) -> Result<RgbaImage> {
+    cancel.check()?;
+    if original.dimensions() != outline_free_fill.dimensions() {
+        return Err(Error::InvalidDimensions);
+    }
+    let (sw, sh) = original.dimensions();
+    if sw == 0 || sh == 0 || width == 0 || height == 0 || width > sw || height > sh {
+        return Err(Error::InvalidDimensions);
+    }
+    check_working_set_budget(sw, sh, width, height, DEFAULT_MEMORY_LIMIT)?;
+    let prepared = Prepared::new(original, cancel)?;
+    prepared.resize_over_fill(
+        original,
+        outline_free_fill,
+        FillResize {
+            w: width,
+            h: height,
+            aa,
+            outline_color,
+        },
+        cancel,
+    )
 }

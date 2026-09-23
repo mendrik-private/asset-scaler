@@ -18,7 +18,10 @@ pub fn detect(image: &RgbaImage, cancel: &dyn Cancellation) -> Result<Vec<Sample
                 - a;
     }
     let mut records = Vec::new();
-    for sigma in [0.65f64, 1., 1.5, 2.2] {
+    // Preserve the existing scales and add one narrow-ink pass.  At 0.5px,
+    // the derivative kernel remains a finite 5-tap filter while retaining a
+    // one-pixel asymmetric outline that the 0.65px minimum smears away.
+    for sigma in [0.5f64, 0.65, 1., 1.5, 2.2] {
         let [l, gx, gy, hxx, hyy, hxy] = lum.gaussian_derivatives(sigma, cancel)?;
         for (dx, dy) in [(1f64, 0f64), (0., 1.), (1., 1.), (1., -1.)] {
             for y in 5..h.saturating_sub(5) {
@@ -193,4 +196,126 @@ pub fn controls(m: &Model, scale: f64) -> [[f64; 2]; 3] {
         2. * pm[1] - (p0[1] + p2[1]) * 0.5,
     ];
     [p0, p1, p2].map(|p| [(p[0] + 0.5) * scale - 0.5, (p[1] + 0.5) * scale - 0.5])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{CancellationToken, cleanup, source};
+
+    // A native-resolution crop of the reported tail has at least 12 source
+    // pixels around the covered diagonal.  That exceeds the 9px radius of the
+    // largest 2.2px Gaussian kernel, so filter reflection cannot create it.
+    const TAIL: &[u8] = include_bytes!("../tests/fixtures/red_dragon_tail.png");
+    const MISSING_EDGE: [[usize; 2]; 33] = [
+        [65, 20],
+        [64, 21],
+        [63, 22],
+        [62, 23],
+        [60, 24],
+        [59, 25],
+        [58, 26],
+        [57, 27],
+        [56, 28],
+        [55, 29],
+        [54, 30],
+        [53, 31],
+        [51, 32],
+        [50, 33],
+        [49, 34],
+        [48, 35],
+        [47, 36],
+        [46, 37],
+        [46, 38],
+        [45, 39],
+        [44, 40],
+        [43, 41],
+        [42, 42],
+        [41, 43],
+        [40, 44],
+        [39, 45],
+        [39, 46],
+        [38, 47],
+        [37, 48],
+        [36, 49],
+        [35, 50],
+        [34, 51],
+        [34, 52],
+    ];
+
+    fn tail_fixture() -> RgbaImage {
+        image::load_from_memory_with_format(TAIL, image::ImageFormat::Png)
+            .unwrap()
+            .into_rgba8()
+    }
+
+    fn covered_points(mask: &crate::raster::Mask) -> usize {
+        MISSING_EDGE
+            .iter()
+            .filter(|&&[x, y]| {
+                (-1isize..=1)
+                    .any(|dy| (-1isize..=1).any(|dx| mask.at(x as isize + dx, y as isize + dy)))
+            })
+            .count()
+    }
+
+    fn source_mask(image: &RgbaImage) -> crate::raster::Mask {
+        let cancel = CancellationToken::default();
+        let samples = detect(image, &cancel).unwrap();
+        let models = fit_models(&samples, 0.012, &cancel).unwrap();
+        let (raw, distance) = source::rasterize(
+            &models,
+            image.width() as usize,
+            image.height() as usize,
+            &cancel,
+        )
+        .unwrap();
+        cleanup::thin(&raw, &distance, &cancel).unwrap()
+    }
+
+    #[test]
+    fn narrow_asymmetric_tail_outline_survives_source_extraction() {
+        let image = tail_fixture();
+        let thinned = source_mask(&image);
+        assert!(
+            covered_points(&thinned) == MISSING_EDGE.len(),
+            "expected dense 1px-tolerant coverage of the 33px asymmetric tail outline; got {}",
+            covered_points(&thinned),
+        );
+    }
+
+    #[test]
+    fn narrow_scale_keeps_flat_steps_transparency_ramps_and_isolated_noise_empty() {
+        let opaque_flat = RgbaImage::from_pixel(96, 64, image::Rgba([30, 30, 30, 255]));
+        let opaque_step = RgbaImage::from_fn(96, 64, |x, _| {
+            image::Rgba(if x < 48 {
+                [20, 20, 20, 255]
+            } else {
+                [245, 245, 245, 255]
+            })
+        });
+        let ramp = RgbaImage::from_fn(96, 64, |x, _| {
+            let value = 20 + (x * 220 / 95) as u8;
+            image::Rgba([value, value, value, 255])
+        });
+        let transparent_noise = RgbaImage::from_fn(96, 64, |x, y| {
+            image::Rgba([(x * 37) as u8, (y * 73) as u8, ((x + y) * 11) as u8, 0])
+        });
+        let isolated_noise = RgbaImage::from_pixel(96, 64, image::Rgba([250, 250, 250, 255]));
+        let mut isolated_noise = isolated_noise;
+        isolated_noise.put_pixel(48, 32, image::Rgba([0, 0, 0, 255]));
+        for (name, image) in [
+            ("opaque flat", opaque_flat),
+            ("plain dark/light step", opaque_step),
+            ("smooth ramp", ramp),
+            ("transparent hidden RGB", transparent_noise),
+            ("isolated dark pixel", isolated_noise),
+        ] {
+            let mask = source_mask(&image);
+            assert!(
+                mask.data.iter().all(|&on| !on),
+                "{name} produced a source contour"
+            );
+        }
+    }
 }

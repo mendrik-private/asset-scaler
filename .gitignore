@@ -1,3 +1,4 @@
 /target/
 .DS_Store
 *.swp
+/experiments/qwen-outline-free/

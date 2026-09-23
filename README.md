@@ -120,12 +120,42 @@ allocation quota.
 ## Transparency and silhouettes
 
 For transparent images, source alpha defines the silhouette: internal ink lines
-do not cut holes into solid limbs or clothing. The scaler also preserves the
-tips of thin components on opaque, flat backgrounds. Regression tests cover
-both cases.
+do not cut holes into solid limbs or clothing. For an opaque image with a
+confidently flat, boundary-connected canvas, the scaler extracts that canvas as
+transparent support before reduction. Mixed or nonuniform canvases remain
+opaque because the library cannot infer a reliable exterior from them. Identity
+requests return the original pixels unchanged.
 
-The library does not remove backgrounds. Use the HTTP asset processor below
-when you need background removal as well as resizing.
+To keep an opaque canvas, create a session with
+`ResizeOptions::preserve_opaque_background()` or pass that option to
+`resize_with_options`. Transparent source alpha remains authoritative in either
+mode.
+
+When a model removes the background, preserve contours measured from the
+original artwork by preparing a session **before applying the model mask** and
+then supplying its foreground:
+
+```rust,no_run
+# use asset_scaler::{CancellationToken, GameAssetAa, Session};
+# use image::RgbaImage;
+# use std::sync::Arc;
+# let original = Arc::new(RgbaImage::new(400, 400));
+# let cancel = CancellationToken::default();
+let session = Session::new(original.clone());
+session.prepare(&cancel)?;
+// Apply the model mask after contour analysis.
+# let foreground = original.as_ref().clone();
+// `foreground` is the same-sized RGBA image returned by that masking step.
+let sprite = session.resize_with_foreground(
+    &foreground, 200, 200, GameAssetAa::new(20), &cancel,
+)?;
+# Ok::<(), asset_scaler::Error>(())
+```
+
+`resize_with_foreground_ink` additionally colours retained contours from the
+visible foreground. At the target resolution it combines touching contour
+cores, thins the combined path toward the exterior, and removes isolated runs
+shorter than three pixels before applying antialiasing.
 
 ## HTTP asset processor
 

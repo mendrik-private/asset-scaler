@@ -84,7 +84,80 @@ fn direct_source_lanczos_oracle(source: &color::LinearImage, w: u32, h: u32) -> 
 }
 
 #[test]
-fn silhouette_keeps_exterior_and_transparent_hidden_rgb_isolated() {
+fn outline_free_fill_uses_the_clean_fill_and_keeps_colour_modes_separate() {
+    let original = outlined_fixture(true);
+    let fill = RgbaImage::from_fn(original.width(), original.height(), |x, y| {
+        let alpha = original.get_pixel(x, y)[3];
+        image::Rgba([230, 170, 90, alpha])
+    });
+    let cancel = CancellationToken::default();
+    let prepared = Prepared::new(&original, &cancel).unwrap();
+    let target = prepared
+        .target_contours(&original, 31, 29, GameAssetAa::new(30), &cancel)
+        .unwrap();
+    let expected = direct_source_lanczos_oracle(&color::LinearImage::from_rgba(&fill), 31, 29);
+    let original_ink = resize_with_outline_free_fill(
+        &original,
+        &fill,
+        31,
+        29,
+        GameAssetAa::new(30),
+        OutlineColor::OriginalInk,
+        &cancel,
+    )
+    .unwrap();
+    let darkened_fill = resize_with_outline_free_fill(
+        &original,
+        &fill,
+        31,
+        29,
+        GameAssetAa::new(30),
+        OutlineColor::DarkenedFill { luminance: 0.25 },
+        &cancel,
+    )
+    .unwrap();
+    let clean_pixel = target
+        .strokes
+        .coverage
+        .as_raw()
+        .iter()
+        .enumerate()
+        .find_map(|(i, &coverage)| {
+            (coverage == 0 && expected.as_raw()[i * 4 + 3] == 255).then_some(i)
+        })
+        .expect("fixture must contain an opaque unpainted fill pixel");
+    assert_eq!(
+        &original_ink.as_raw()[clean_pixel * 4..clean_pixel * 4 + 4],
+        &expected.as_raw()[clean_pixel * 4..clean_pixel * 4 + 4],
+        "clean regions must come solely from the outline-free fill"
+    );
+    let core_pixel = target
+        .strokes
+        .core
+        .as_raw()
+        .iter()
+        .position(|&value| value == 255)
+        .expect("fixture must retain a contour core");
+    assert!(
+        darkened_fill.as_raw()[core_pixel * 4] > original_ink.as_raw()[core_pixel * 4],
+        "the fill-derived contour must not accidentally reuse original dark ink"
+    );
+    assert!(matches!(
+        resize_with_outline_free_fill(
+            &original,
+            &RgbaImage::new(1, 1),
+            31,
+            29,
+            GameAssetAa::new(30),
+            OutlineColor::OriginalInk,
+            &cancel,
+        ),
+        Err(Error::InvalidDimensions)
+    ));
+}
+
+#[test]
+fn silhouette_hides_flat_canvas_and_transparent_hidden_rgb() {
     let source = Arc::new(outlined_fixture(false));
     let cancel = CancellationToken::default();
     let session = Session::new(source.clone());
@@ -97,14 +170,11 @@ fn silhouette_keeps_exterior_and_transparent_hidden_rgb_isolated() {
     let target = prepared
         .target_contours(&source, 31, 29, GameAssetAa::new(0), &cancel)
         .unwrap();
-    assert!(
-        (0..coverage.len()).any(|i| {
-            coverage[i] < 0.5
-                && target.strokes.coverage.as_raw()[i] == 0
-                && current.as_raw()[i * 4..i * 4 + 4] == [37, 83, 149, 255]
-        }),
-        "fixture must preserve an unpainted opaque exterior"
-    );
+    for (i, &support) in coverage.iter().enumerate() {
+        if support < 0.5 && target.strokes.coverage.as_raw()[i] == 0 {
+            assert_eq!(&current.as_raw()[i * 4..i * 4 + 4], &[0; 4], "pixel {i}");
+        }
+    }
     let transparent = Arc::new(outlined_fixture(true));
     let transparent_session = Session::new(transparent);
     let transparent_result = transparent_session
@@ -166,10 +236,13 @@ fn silhouette_support_handles_every_small_downscale_shape_and_aa() {
                     .target_contours(&source, w, h, aa, &cancel)
                     .unwrap();
                 for (i, &support) in coverage.iter().enumerate() {
-                    if support == 0. && contours.strokes.coverage.as_raw()[i] == 0 {
+                    if support == 0.
+                        && contours.strokes.coverage.as_raw()[i] == 0
+                        && (w, h) != source.dimensions()
+                    {
                         assert_eq!(
                             output.get_pixel((i % w as usize) as u32, (i / w as usize) as u32),
-                            &image::Rgba([37, 83, 149, 255])
+                            &image::Rgba([0; 4])
                         );
                     }
                 }
@@ -432,6 +505,442 @@ fn retained_ink_excludes_short_neighbors() {
         .unwrap();
     assert!(retained.data[5 * 24 + 8]);
     assert!(!retained.data[7 * 24 + 8]);
+}
+
+#[test]
+fn aa_zero_foreground_ink_keeps_owned_core_black_and_uses_exact_darkened_donor_colours() {
+    let original = RgbaImage::from_fn(64, 64, |x, y| {
+        if (12..52).contains(&x) && (12..52).contains(&y) {
+            if y == 31 && (21..43).contains(&x) {
+                image::Rgba([0, 0, 0, 255])
+            } else {
+                image::Rgba([150, 110, 80, 255])
+            }
+        } else {
+            image::Rgba([245, 240, 230, 255])
+        }
+    });
+    let foreground = RgbaImage::from_fn(64, 64, |x, y| {
+        if (12..52).contains(&x) && (12..52).contains(&y) {
+            image::Rgba([200, 150, 100, 255])
+        } else {
+            image::Rgba([0, 0, 0, 0])
+        }
+    });
+    let cancel = CancellationToken::default();
+    let prepared = Prepared::new(&original, &cancel).unwrap();
+    let foreground_linear = color::LinearImage::from_rgba(&foreground);
+    let request = ForegroundInkResize {
+        w: 32,
+        h: 32,
+        aa: GameAssetAa::new(0),
+        brightness: 0.,
+    };
+    let black_target = prepared
+        .target_contours_with_ink_source(
+            &original,
+            request.w,
+            request.h,
+            request.aa,
+            InkSource {
+                linear: &foreground_linear,
+                suppress_unsupported: true,
+                brightness: Some(request.brightness),
+            },
+            &cancel,
+        )
+        .unwrap();
+    let black = prepared
+        .resize_with_foreground_ink(&original, &foreground, request, &cancel)
+        .unwrap();
+    let owned_core: Vec<_> = black_target
+        .strokes
+        .core
+        .as_raw()
+        .iter()
+        .zip(&black_target.strokes.owners)
+        .enumerate()
+        .filter_map(|(i, (&core, owner))| (core != 0 && owner.is_some()).then_some(i))
+        .collect();
+    assert!(
+        !owned_core.is_empty(),
+        "fixture retains a narrow contour core"
+    );
+    let owner = black_target.strokes.owners[owned_core[0]].unwrap();
+    let intrinsic = opacity::calculate(
+        &prepared.widths,
+        &black_target.strokes.core,
+        &black_target.strokes.owners,
+    )[owner];
+    let strengths: Vec<_> = [0, 1, 50, 99, 100]
+        .into_iter()
+        .map(|aa| {
+            prepared.foreground_ink_strengths(&black_target.strokes, GameAssetAa::new(aa))[owner]
+        })
+        .collect();
+    assert_eq!(strengths[0], 1.);
+    assert_eq!(strengths[4], intrinsic);
+    assert!(strengths.windows(2).all(|pair| pair[0] >= pair[1]));
+    assert!(strengths[1] < 1. && strengths[3] > intrinsic);
+    for i in &owned_core {
+        assert_eq!(
+            &black.as_raw()[i * 4..i * 4 + 4],
+            &[0, 0, 0, 255],
+            "AA0 owned core {i} must be solid black"
+        );
+    }
+
+    let dark_target = prepared
+        .target_contours_with_ink_source(
+            &original,
+            32,
+            32,
+            GameAssetAa::new(0),
+            InkSource {
+                linear: &foreground_linear,
+                suppress_unsupported: true,
+                brightness: Some(0.8),
+            },
+            &cancel,
+        )
+        .unwrap();
+    let dark = prepared
+        .resize_with_foreground_ink(
+            &original,
+            &foreground,
+            ForegroundInkResize {
+                w: 32,
+                h: 32,
+                aa: GameAssetAa::new(0),
+                brightness: 0.8,
+            },
+            &cancel,
+        )
+        .unwrap();
+    let clean = dark_target
+        .strokes
+        .coverage
+        .as_raw()
+        .iter()
+        .enumerate()
+        .find_map(|(i, &coverage)| (coverage == 0 && black.as_raw()[i * 4 + 3] == 255).then_some(i))
+        .expect("fixture retains an opaque unpainted interior");
+    assert_eq!(
+        &black.as_raw()[clean * 4..clean * 4 + 4],
+        &dark.as_raw()[clean * 4..clean * 4 + 4],
+        "foreground ink brightness leaves the finished fill unchanged"
+    );
+    for i in owned_core {
+        let expected = color::rgba([
+            dark_target.colors[i][0],
+            dark_target.colors[i][1],
+            dark_target.colors[i][2],
+            1.,
+        ]);
+        assert_eq!(
+            &dark.as_raw()[i * 4..i * 4 + 4],
+            &expected.0,
+            "AA0 owned core {i} must use its exact darkened foreground donor"
+        );
+    }
+}
+
+#[test]
+fn canonical_cleanup_drops_short_components_without_aa_ghosts() {
+    let cancel = CancellationToken::default();
+    for aa in [0, 100] {
+        let mut strokes = strokes::Strokes {
+            core: image::GrayImage::new(8, 4),
+            coverage: image::GrayImage::new(8, 4),
+            owners: vec![None; 32],
+        };
+        // Two core pixels plus a formerly antialiased neighbor. The target
+        // component is below the three-pixel cutoff and must leave no paint at
+        // either AA endpoint.
+        for (i, coverage) in [(8 + 1, 255), (8 + 2, 255), (8 + 3, 96)] {
+            if coverage == 255 {
+                strokes.core.as_mut()[i] = 255;
+            }
+            strokes.coverage.as_mut()[i] = coverage;
+            strokes.owners[i] = Some(0);
+        }
+        let mut colors = vec![[0.2, 0.1, 0.05]; 32];
+        Prepared::canonicalize_foreground_strokes(
+            &mut strokes,
+            &mut colors,
+            &[false; 32],
+            GameAssetAa::new(aa),
+            &cancel,
+        )
+        .unwrap();
+        for i in [8 + 1, 8 + 2, 8 + 3] {
+            assert_eq!(strokes.core.as_raw()[i], 0, "AA{aa} core {i}");
+            assert_eq!(strokes.coverage.as_raw()[i], 0, "AA{aa} coverage {i}");
+            assert_eq!(strokes.owners[i], None, "AA{aa} owner {i}");
+        }
+    }
+}
+
+struct ForegroundInkBeforeHaloCleanup {
+    image: RgbaImage,
+    support: Vec<bool>,
+    fill: color::LinearImage,
+    core: image::GrayImage,
+    coverage: image::GrayImage,
+    owners: Vec<Option<usize>>,
+    colors: Vec<[f64; 3]>,
+}
+
+/// Compose the canonical foreground-ink path immediately before halo cleanup.
+/// This is an integration-test baseline, not a second halo implementation.
+fn foreground_ink_before_halo_cleanup(
+    prepared: &Prepared,
+    original: &RgbaImage,
+    foreground: &RgbaImage,
+    request: &ForegroundInkResize,
+    cancel: &dyn Cancellation,
+) -> ForegroundInkBeforeHaloCleanup {
+    let fill_linear = color::LinearImage::from_rgba(foreground);
+    let fill_silhouette = silhouette::Silhouette::detect(foreground, cancel)
+        .unwrap()
+        .expect("the fixture has a foreground silhouette");
+    let TargetContours {
+        mut strokes,
+        mut colors,
+    } = prepared
+        .target_contours_with_ink_source(
+            original,
+            request.w,
+            request.h,
+            request.aa,
+            InkSource {
+                linear: &fill_linear,
+                suppress_unsupported: true,
+                brightness: Some(request.brightness),
+            },
+            cancel,
+        )
+        .unwrap();
+    let FinishedFill {
+        linear: fill,
+        foreground_support,
+    } = prepared
+        .fill_for_target(
+            &fill_linear,
+            Some(&fill_silhouette),
+            &strokes,
+            FillTarget {
+                target: (request.w, request.h),
+                aa: request.aa,
+                foreground_support: true,
+            },
+            cancel,
+        )
+        .unwrap();
+    let support = foreground_support.expect("foreground support was requested");
+    Prepared::canonicalize_foreground_strokes(
+        &mut strokes,
+        &mut colors,
+        &support,
+        request.aa,
+        cancel,
+    )
+    .unwrap();
+    let strength = prepared.foreground_ink_strengths(&strokes, request.aa);
+    let paint = opacity::apply(&strokes.coverage, &strokes.owners, &strength);
+    let baseline = paint::composite(&fill, &colors, &paint);
+    ForegroundInkBeforeHaloCleanup {
+        image: baseline,
+        support,
+        fill,
+        core: strokes.core,
+        coverage: strokes.coverage,
+        owners: strokes.owners,
+        colors,
+    }
+}
+
+fn halo_foreground_fixture(semitransparent_original: bool) -> (RgbaImage, RgbaImage) {
+    let mut original = RgbaImage::from_fn(64, 64, |x, y| {
+        let inside = (12..52).contains(&x) && (12..52).contains(&y);
+        let ink = y == 31 && (21..43).contains(&x);
+        image::Rgba(if ink {
+            [0, 0, 0, 255]
+        } else if inside {
+            [150, 110, 80, 255]
+        } else {
+            [220, 230, 245, 255]
+        })
+    });
+    if semitransparent_original {
+        original.put_pixel(0, 0, image::Rgba([220, 230, 245, 254]));
+    }
+    let foreground = RgbaImage::from_fn(64, 64, |x, y| {
+        let inside = (12..52).contains(&x) && (12..52).contains(&y);
+        let ink = y == 31 && (21..43).contains(&x);
+        let fringe = (20..44).contains(&x) && (27..31).contains(&y);
+        image::Rgba(if ink {
+            [0, 0, 0, 255]
+        } else if fringe {
+            // A residual from an extracted foreground remains source-supported
+            // but falls below the compositor's 0.5 support threshold after
+            // resampling, producing a low-alpha exterior next to original ink.
+            [255, 255, 255, 20]
+        } else if inside {
+            [200, 150, 100, 255]
+        } else {
+            [255, 0, 255, 0]
+        })
+    });
+    (original, foreground)
+}
+
+fn assert_foreground_ink_halo_cleanup(aa: u8) {
+    let cancel = CancellationToken::default();
+    let request = ForegroundInkResize {
+        w: 31,
+        h: 31,
+        aa: GameAssetAa::new(aa),
+        brightness: 1.,
+    };
+    let (w, h) = (request.w, request.h);
+    let (original, foreground) = halo_foreground_fixture(false);
+    let prepared = Prepared::new(&original, &cancel).unwrap();
+    let before =
+        foreground_ink_before_halo_cleanup(&prepared, &original, &foreground, &request, &cancel);
+    let after = prepared
+        .resize_with_foreground_ink(&original, &foreground, request, &cancel)
+        .unwrap();
+    let fringe = (0..before.support.len())
+        .find(|&i| {
+            !before.support[i]
+                && (0. < before.fill.pixels[i][3] && before.fill.pixels[i][3] < 0.25)
+                && before.core.as_raw()[i] == 0
+                && before.owners[i].is_none()
+                && before.image.as_raw()[i * 4] > 150
+                && (-2isize..=2).any(|dy| {
+                    (-2isize..=2).any(|dx| {
+                        let xx = i % w as usize;
+                        let yy = i / w as usize;
+                        let xx = xx as isize + dx;
+                        let yy = yy as isize + dy;
+                        xx >= 0
+                            && yy >= 0
+                            && xx < w as isize
+                            && yy < h as isize
+                            && before.core.as_raw()[yy as usize * w as usize + xx as usize] != 0
+                            && before.owners[yy as usize * w as usize + xx as usize].is_some()
+                    })
+                })
+        })
+        .expect("fixture must produce a bright low-alpha exterior fringe");
+    let x = (fringe % w as usize) as u32;
+    let y = (fringe / w as usize) as u32;
+    let mut donor = None;
+    for dy in -2isize..=2 {
+        for dx in -2isize..=2 {
+            if dx == 0 && dy == 0 {
+                continue;
+            }
+            let xx = x as isize + dx;
+            let yy = y as isize + dy;
+            if xx < 0 || yy < 0 || xx >= w as isize || yy >= h as isize {
+                continue;
+            }
+            let i = yy as usize * w as usize + xx as usize;
+            let Some(owner) = before.owners[i] else {
+                continue;
+            };
+            if before.core.as_raw()[i] == 0 {
+                continue;
+            }
+            let rank = (
+                dx * dx + dy * dy,
+                std::cmp::Reverse(before.coverage.as_raw()[i]),
+                owner,
+                i,
+            );
+            if donor.is_none_or(|(best, _)| rank < best) {
+                donor = Some((rank, i));
+            }
+        }
+    }
+    let donor = donor
+        .map(|(_, i)| i)
+        .expect("the fringe must be within two pixels of an owned core donor");
+    let expected = color::rgba([
+        before.colors[donor][0],
+        before.colors[donor][1],
+        before.colors[donor][2],
+        1.,
+    ]);
+    assert_eq!(
+        &after.as_raw()[fringe * 4..fringe * 4 + 3],
+        &expected.0[..3],
+        "opaque originals replace exterior fringe RGB with the core donor"
+    );
+    assert_eq!(
+        after.as_raw()[fringe * 4 + 3],
+        before.image.as_raw()[fringe * 4 + 3],
+        "cleanup retains the baseline alpha byte"
+    );
+    assert_ne!(
+        &after.as_raw()[fringe * 4..fringe * 4 + 3],
+        &before.image.as_raw()[fringe * 4..fringe * 4 + 3],
+        "the fixture's bright fill fringe is actually repaired"
+    );
+    for (i, &core) in before.core.as_raw().iter().enumerate() {
+        if core != 0 {
+            assert_eq!(
+                &after.as_raw()[i * 4..i * 4 + 4],
+                &before.image.as_raw()[i * 4..i * 4 + 4],
+                "core {i} stays frozen"
+            );
+        }
+        if before.support[i] && before.coverage.as_raw()[i] == 0 {
+            assert_eq!(
+                &after.as_raw()[i * 4..i * 4 + 4],
+                &before.image.as_raw()[i * 4..i * 4 + 4],
+                "supported interior {i} stays unchanged"
+            );
+        }
+    }
+
+    let (transparent_original, transparent_foreground) = halo_foreground_fixture(true);
+    let transparent_prepared = Prepared::new(&transparent_original, &cancel).unwrap();
+    let transparent_before = foreground_ink_before_halo_cleanup(
+        &transparent_prepared,
+        &transparent_original,
+        &transparent_foreground,
+        &ForegroundInkResize {
+            w,
+            h,
+            aa: GameAssetAa::new(aa),
+            brightness: 1.,
+        },
+        &cancel,
+    );
+    let transparent_after = transparent_prepared
+        .resize_with_foreground_ink(
+            &transparent_original,
+            &transparent_foreground,
+            ForegroundInkResize {
+                w,
+                h,
+                aa: GameAssetAa::new(aa),
+                brightness: 1.,
+            },
+            &cancel,
+        )
+        .unwrap();
+    assert_eq!(transparent_after, transparent_before.image);
+}
+
+#[test]
+fn foreground_ink_cleans_only_opaque_originals_low_alpha_exterior_fringe() {
+    for aa in [0, 100] {
+        assert_foreground_ink_halo_cleanup(aa);
+    }
 }
 
 #[test]

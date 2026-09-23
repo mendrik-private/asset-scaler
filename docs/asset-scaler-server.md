@@ -51,6 +51,11 @@ source mask. `mask=model` is the default. `mask=edge-matte` instead removes a
 connected, edge-coloured matte and bypasses model inference for that request;
 the server still validates and warms the InSPyReNet runtime at startup.
 
+For reductions, the server prepares Game Asset contours from the normalized
+original before Model or Edge Matte removal. It then resamples the removed
+foreground and draws those original contours. Identity outputs are copied and
+enlargements remain bicubic.
+
 `GET /health` returns `ok`. Browser requests from `localhost`, `127.0.0.1`, or
 `::1` receive CORS headers; other origins do not. A second concurrent
 `POST /process` receives HTTP 429 instead of waiting in memory. Once accepted,

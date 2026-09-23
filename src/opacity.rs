@@ -6,7 +6,7 @@ use image::{GrayImage, RgbaImage};
 pub fn strength(length: usize, width: f64) -> f64 {
     let length = ((length as f64 - 4.) / 28.).clamp(0., 1.);
     let width = ((width - 1.) / 5.).clamp(0., 1.);
-    0.6 + 0.4 * (length * width).sqrt()
+    0.95 + 0.05 * (length * width).sqrt()
 }
 
 fn measure(source: &RgbaImage, mask: &Mask, p: &Sample) -> Option<f64> {
@@ -85,13 +85,14 @@ mod tests {
     use super::*;
     #[test]
     fn opacity_is_bounded_monotonic_and_needs_both_length_and_width() {
-        assert_eq!(strength(4, 1.), 0.6);
-        assert_eq!(strength(100, 1.), 0.6);
-        assert_eq!(strength(4, 10.), 0.6);
+        assert_eq!(strength(4, 1.), 0.95);
+        assert_eq!(strength(100, 1.), 0.95);
+        assert_eq!(strength(4, 10.), 0.95);
         assert_eq!(strength(32, 6.), 1.);
         assert_eq!(strength(100, 10.), 1.);
         for l in 0..100 {
             for w in 1..10 {
+                assert!((0.95..=1.).contains(&strength(l, w as f64)));
                 assert!(strength(l + 1, w as f64) >= strength(l, w as f64));
                 assert!(strength(l, w as f64 + 1.) >= strength(l, w as f64));
             }
@@ -112,8 +113,8 @@ mod tests {
         }
         let coverage = GrayImage::from_raw(3, 1, vec![255, 128, 0]).unwrap();
         assert_eq!(
-            apply(&coverage, &[Some(0), Some(0), None], &[0.6]).as_raw(),
-            &[153, 77, 0]
+            apply(&coverage, &[Some(0), Some(0), None], &[0.95]).as_raw(),
+            &[242, 122, 0]
         );
     }
 }

@@ -21,24 +21,10 @@ fn generate_readme_images() -> std::result::Result<(), Box<dyn std::error::Error
         .coverage
         .save(directory.join("elf-contour-coverage.png"))?;
 
-    // Match the silhouette support and retained-ink projection used by resize.
+    // Match the silhouette support coverage used by resize.
     let silhouette = prepared.silhouette.as_ref().expect("elf has source alpha");
-    let mut retained =
-        prepared
-            .contours
-            .retained_ink_mask(&prepared.mask, [0.25, 0.25], &cancel)?;
-    for (masked, &supported) in retained.data.iter_mut().zip(&silhouette.support.data) {
-        *masked &= supported;
-    }
     let source_coverage = silhouette.coverage(200, 200, &cancel)?;
-    let retained_coverage = silhouette.project_mask(&retained, 200, 200, &cancel)?;
-    let coverage = silhouette.target_coverage(
-        &source_coverage,
-        &retained_coverage,
-        &target.strokes.core,
-        aa,
-        &cancel,
-    )?;
+    let coverage = silhouette.target_coverage(&source_coverage, aa, &cancel)?;
     GrayImage::from_fn(200, 200, |x, y| {
         Luma([(coverage[(y * 200 + x) as usize] * 255.).round() as u8])
     })
