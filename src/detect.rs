@@ -18,11 +18,15 @@ pub fn detect(image: &RgbaImage, cancel: &dyn Cancellation) -> Result<Vec<Sample
                 - a;
     }
     let mut records = Vec::new();
+    let mut fine = None;
     // Preserve the existing scales and add one narrow-ink pass.  At 0.5px,
     // the derivative kernel remains a finite 5-tap filter while retaining a
     // one-pixel asymmetric outline that the 0.65px minimum smears away.
     for sigma in [0.5f64, 0.65, 1., 1.5, 2.2] {
         let [l, gx, gy, hxx, hyy, hxy] = lum.gaussian_derivatives(sigma, cancel)?;
+        if fine.is_none() {
+            fine = Some(l.clone());
+        }
         for (dx, dy) in [(1f64, 0f64), (0., 1.), (1., 1.), (1., -1.)] {
             for y in 5..h.saturating_sub(5) {
                 cancel.check()?;
@@ -98,7 +102,83 @@ pub fn detect(image: &RgbaImage, cancel: &dyn Cancellation) -> Result<Vec<Sample
             out.push(p);
         }
     }
-    Ok(out)
+    match fine {
+        Some(fine) => merge_scale_duplicates(out, &fine, cancel),
+        None => Ok(out),
+    }
+}
+
+/// Farthest normal separation, beyond the sample scale, at which two aligned
+/// ridge samples can still describe one ink band.
+const SAME_BAND_REACH: f64 = 1.5;
+/// A lighter valley of at least this luminance separates two parallel strokes.
+const SEPARATING_GAP: f64 = 0.05;
+
+/// Collapse parallel ridge samples that describe one physical ink band.
+///
+/// A wide or asymmetric outline, such as black ink beside dark shading, pulls
+/// the coarse-scale ridge up to 1.5px off the fine-scale ink core. Both
+/// survive the isotropic 0.8px suppression, and their rasterized union then
+/// leaves slivers that thinning preserves as ladders and small loops. Samples
+/// are the same band when they are aligned, displaced mostly along their
+/// normal and joined by continuous ink: the lightly smoothed luminance never
+/// rises by [`SEPARATING_GAP`] between them. The darkest sample is the ink core
+/// and represents the band; distinct nearby strokes keep their lighter gap.
+fn merge_scale_duplicates(
+    samples: Vec<Sample>,
+    fine: &Field,
+    cancel: &dyn Cancellation,
+) -> Result<Vec<Sample>> {
+    let centers: Vec<f64> = samples.iter().map(|p| fine.sample(p[0], p[1])).collect();
+    let mut order: Vec<usize> = (0..samples.len()).collect();
+    order.sort_by(|&a, &b| {
+        centers[a]
+            .total_cmp(&centers[b])
+            .then(samples[b][4].total_cmp(&samples[a][4]))
+            .then(a.cmp(&b))
+    });
+    let tree = Spatial::new(samples.iter().map(|p| [p[0], p[1]]).collect(), 4.);
+    let mut removed = vec![false; samples.len()];
+    for (position, &i) in order.iter().enumerate() {
+        if position.is_multiple_of(4096) {
+            cancel.check()?;
+        }
+        if removed[i] {
+            continue;
+        }
+        let p = samples[i];
+        let reach_limit = SAME_BAND_REACH + 2.2;
+        for j in tree.radius([p[0], p[1]], reach_limit) {
+            if j == i || removed[j] {
+                continue;
+            }
+            let q = samples[j];
+            if (p[2] * q[2] + p[3] * q[3]).abs() <= 0.8 {
+                continue;
+            }
+            let (dx, dy) = (q[0] - p[0], q[1] - p[1]);
+            let along = (-dx * p[3] + dy * p[2]).abs();
+            let across = (dx * p[2] + dy * p[3]).abs();
+            if along > 0.6 || across > SAME_BAND_REACH + p[7].max(q[7]) {
+                continue;
+            }
+            let steps = (across / 0.25).ceil().max(1.) as usize;
+            let peak = (1..steps)
+                .map(|k| {
+                    let t = k as f64 / steps as f64;
+                    fine.sample(p[0] + dx * t, p[1] + dy * t)
+                })
+                .fold(f64::NEG_INFINITY, f64::max);
+            if peak < centers[i].max(centers[j]) + SEPARATING_GAP {
+                removed[j] = true;
+            }
+        }
+    }
+    Ok(samples
+        .into_iter()
+        .zip(removed)
+        .filter_map(|(sample, removed)| (!removed).then_some(sample))
+        .collect())
 }
 
 pub fn fit_models(
@@ -201,7 +281,7 @@ pub fn controls(m: &Model, scale: f64) -> [[f64; 2]; 3] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{CancellationToken, cleanup, source};
+    use crate::{CancellationToken, source};
 
     // A native-resolution crop of the reported tail has at least 12 source
     // pixels around the covered diagonal.  That exceeds the 9px radius of the
@@ -263,14 +343,63 @@ mod tests {
         let cancel = CancellationToken::default();
         let samples = detect(image, &cancel).unwrap();
         let models = fit_models(&samples, 0.012, &cancel).unwrap();
-        let (raw, distance) = source::rasterize(
+        source::skeleton(
             &models,
             image.width() as usize,
             image.height() as usize,
             &cancel,
         )
-        .unwrap();
-        cleanup::thin(&raw, &distance, &cancel).unwrap()
+        .unwrap()
+    }
+
+    fn ridge_offsets(samples: &[Sample], y: std::ops::Range<f64>) -> Vec<f64> {
+        let mut xs: Vec<_> = samples
+            .iter()
+            .filter(|s| y.contains(&s[1]))
+            .map(|s| s[0])
+            .collect();
+        xs.sort_by(f64::total_cmp);
+        xs
+    }
+
+    #[test]
+    fn black_outline_beside_dark_shading_yields_one_ridge_track() {
+        // A 5px black outline on white, with dark shading on its inner side:
+        // coarse scales see a ridge pulled toward the shading.
+        let image = RgbaImage::from_fn(64, 48, |x, _| {
+            image::Rgba(match x {
+                24..29 => [8, 8, 8, 255],
+                29..34 => [70, 45, 25, 255],
+                34.. => [170, 110, 60, 255],
+                _ => [255, 255, 255, 255],
+            })
+        });
+        let cancel = CancellationToken::default();
+        let samples = detect(&image, &cancel).unwrap();
+        let xs = ridge_offsets(&samples, 20.0..21.0);
+        assert!(!xs.is_empty(), "the outline must be detected");
+        assert!(
+            xs.iter().all(|&x| (x - 26.).abs() < 1.6),
+            "one track inside the black band, got {xs:?}"
+        );
+        let skeleton = source_mask(&image);
+        let row: Vec<_> = (0..64).filter(|&x| skeleton.data[20 * 64 + x]).collect();
+        assert_eq!(row.len(), 1, "one centerline, got {row:?}");
+    }
+
+    #[test]
+    fn parallel_strokes_with_a_light_gap_keep_both_tracks() {
+        let image = RgbaImage::from_fn(64, 48, |x, _| {
+            image::Rgba(if x == 24 || x == 27 {
+                [10, 10, 10, 255]
+            } else {
+                [240, 240, 240, 255]
+            })
+        });
+        let cancel = CancellationToken::default();
+        let xs = ridge_offsets(&detect(&image, &cancel).unwrap(), 20.0..21.0);
+        assert!(xs.iter().any(|&x| (x - 24.).abs() < 0.5), "{xs:?}");
+        assert!(xs.iter().any(|&x| (x - 27.).abs() < 0.5), "{xs:?}");
     }
 
     #[test]

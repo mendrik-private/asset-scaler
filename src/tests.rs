@@ -655,7 +655,8 @@ fn retained_ink_excludes_short_neighbors() {
 fn aa_zero_foreground_ink_keeps_owned_core_black_and_uses_exact_darkened_donor_colours() {
     let original = RgbaImage::from_fn(64, 64, |x, y| {
         if (12..52).contains(&x) && (12..52).contains(&y) {
-            if y == 31 && (21..43).contains(&x) {
+            // Long enough to stay drawn as an interior line at tiny targets.
+            if y == 31 && (15..49).contains(&x) {
                 image::Rgba([0, 0, 0, 255])
             } else {
                 image::Rgba([150, 110, 80, 255])
@@ -869,6 +870,7 @@ fn foreground_ink_before_halo_cleanup(
     let FinishedFill {
         linear: fill,
         foreground_support,
+        isolated,
     } = prepared
         .fill_for_target(
             &fill_linear,
@@ -893,7 +895,16 @@ fn foreground_ink_before_halo_cleanup(
     .unwrap();
     let strength = prepared.foreground_ink_strengths(&strokes, request.aa);
     let paint = opacity::apply(&strokes.coverage, &strokes.owners, &strength);
-    let baseline = paint::composite(&fill, &colors, &paint);
+    let clean = deink::apply(
+        isolated.as_ref().unwrap_or(&fill_linear),
+        &prepared.mask,
+        fill.clone(),
+        &strokes.core,
+        &support,
+        cancel,
+    )
+    .unwrap();
+    let baseline = paint::composite(&clean, &colors, &paint);
     ForegroundInkBeforeHaloCleanup {
         image: baseline,
         support,
@@ -908,7 +919,7 @@ fn foreground_ink_before_halo_cleanup(
 fn halo_foreground_fixture(semitransparent_original: bool) -> (RgbaImage, RgbaImage) {
     let mut original = RgbaImage::from_fn(64, 64, |x, y| {
         let inside = (12..52).contains(&x) && (12..52).contains(&y);
-        let ink = y == 31 && (21..43).contains(&x);
+        let ink = y == 31 && (15..49).contains(&x);
         image::Rgba(if ink {
             [0, 0, 0, 255]
         } else if inside {
@@ -922,8 +933,8 @@ fn halo_foreground_fixture(semitransparent_original: bool) -> (RgbaImage, RgbaIm
     }
     let foreground = RgbaImage::from_fn(64, 64, |x, y| {
         let inside = (12..52).contains(&x) && (12..52).contains(&y);
-        let ink = y == 31 && (21..43).contains(&x);
-        let fringe = (20..44).contains(&x) && (27..31).contains(&y);
+        let ink = y == 31 && (15..49).contains(&x);
+        let fringe = (14..50).contains(&x) && (27..31).contains(&y);
         image::Rgba(if ink {
             [0, 0, 0, 255]
         } else if fringe {
@@ -1282,4 +1293,56 @@ fn crowded_owner_rerender_restores_crossing_geometry_and_its_owner_color() {
             );
         }
     }
+}
+
+/// The approved smooth source vectors of the README elf, locked exactly.
+///
+/// Extraction and smoothing were tuned by eye to coloring-book quality; any
+/// change to detection, skeleton cleanup, tracing or cubic fitting shows up
+/// here. After an intentional change, review the new geometry and re-bless:
+/// `ASSET_SCALER_BLESS=1 cargo test -p asset-scaler --lib locked_elf_source_vectors`
+#[test]
+fn locked_elf_source_vectors() {
+    let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let source = image::open(directory.join("docs/images/elf-source.png"))
+        .unwrap()
+        .into_rgba8();
+    let cancel = CancellationToken::default();
+    let prepared = Prepared::new(&source, &cancel).unwrap();
+    let mut svg = String::new();
+    let (sw, sh) = source.dimensions();
+    for (w, h) in [(sw, sh), (200, 200)] {
+        use std::fmt::Write;
+        let scale = [w as f64 / sw as f64, h as f64 / sh as f64];
+        let fit = prepared
+            .contours
+            .polished(scale, contours::MAX_SHORT_PIXELS, &cancel)
+            .unwrap();
+        assert!(fit.max_error <= 2.25 + 1e-9, "fit error {}", fit.max_error);
+        writeln!(
+            svg,
+            r#"<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="0 0 {w} {h}"><rect width="100%" height="100%" fill="white"/><g fill="none" stroke="black" stroke-width="0.6" stroke-linecap="round">"#
+        )
+        .unwrap();
+        for cubic in &fit.cubic_curves {
+            let p = cubic.map(|p| [(p[0] + 0.5) * scale[0] - 0.5, (p[1] + 0.5) * scale[1] - 0.5]);
+            writeln!(
+                svg,
+                r#"<path d="M {:.2} {:.2} C {:.2} {:.2} {:.2} {:.2} {:.2} {:.2}"/>"#,
+                p[0][0], p[0][1], p[1][0], p[1][1], p[2][0], p[2][1], p[3][0], p[3][1]
+            )
+            .unwrap();
+        }
+        svg.push_str("</g></svg>\n");
+    }
+    let locked = directory.join("tests/fixtures/elf-source-vectors.svg");
+    if std::env::var_os("ASSET_SCALER_BLESS").is_some() {
+        std::fs::write(&locked, &svg).unwrap();
+    }
+    let expected = std::fs::read_to_string(&locked).expect("bless the locked vectors first");
+    assert!(
+        svg == expected,
+        "source vectors changed; review and re-bless {}",
+        locked.display()
+    );
 }

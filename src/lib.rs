@@ -15,6 +15,7 @@ mod color;
 mod contours;
 mod coverage;
 mod crowding;
+mod deink;
 mod detect;
 mod field;
 mod foreground_halo;
@@ -31,6 +32,8 @@ mod strokes;
 mod target_cleanup;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod vector_review;
 pub const DEFAULT_MEMORY_LIMIT: u64 = 4 * 1024 * 1024 * 1024;
 // The source phase keeps the established 512 B/pixel allowance for analysis,
 // contour storage and source resampling. Target data is not concurrent
@@ -179,6 +182,9 @@ struct ForegroundInkResize {
 struct FinishedFill {
     linear: color::LinearImage,
     foreground_support: Option<Vec<bool>>,
+    /// The silhouette-isolated fill source, when a silhouette removed a
+    /// canvas. Ink removal must not borrow that canvas as fill colour.
+    isolated: Option<color::LinearImage>,
 }
 struct FillTarget {
     target: (u32, u32),
@@ -205,13 +211,12 @@ impl Prepared {
         let samples = detect::detect(image, cancel)?;
         cancel.check()?;
         let models = detect::fit_models(&samples, 0.012, cancel)?;
-        let (raw, distance) = source::rasterize(
+        let thinned = source::skeleton(
             &models,
             image.width() as usize,
             image.height() as usize,
             cancel,
         )?;
-        let thinned = cleanup::thin(&raw, &distance, cancel)?;
         cancel.check()?;
         let contours = contours::Contours::new(&thinned, &models, cancel)?;
         let mask = ink::ink_mask(image, &samples, &thinned, cancel)?;
@@ -314,14 +319,10 @@ impl Prepared {
             w as f64 / image.width() as f64,
             h as f64 / image.height() as f64,
         ];
-        // The foreground compositor coalesces at target resolution, so it
-        // must keep every nonempty source fragment until that final cutoff.
-        // Ordinary resize retains its established source-resolution cutoff.
-        let cutoff = if ink_source.suppress_unsupported {
-            0
-        } else {
-            contours::MAX_SHORT_PIXELS
-        };
+        // Every path drops lines shorter than the minimum target length;
+        // short connectors between longer lines survive selection, so a line
+        // split at junctions stays continuous.
+        let cutoff = contours::MAX_SHORT_PIXELS;
         let (retained, owners) = self.contours.retain_with_ids(&self.models, scale, cutoff);
         let use_splines = scale[0] < 1. || scale[1] < 1.;
         let fitted = use_splines
@@ -502,14 +503,22 @@ impl Prepared {
         &self,
         contours: &mut TargetContours,
         foreground_support: &[bool],
-        source_strengths: &[f64],
+        lengths: &[f64],
         render: TargetRender<'_, '_>,
     ) -> Result<bool> {
-        let keep = crowding::select(
+        let mut keep = crowding::select(
             &contours.strokes,
             foreground_support,
             &self.widths,
-            source_strengths,
+            lengths,
+            render.cancel,
+        )?;
+        // Tiny targets keep only outlines and long interior lines.
+        crowding::drop_short_interior(
+            &contours.strokes,
+            foreground_support,
+            &mut keep,
+            crowding::interior_minimum(render.target.0, render.target.1),
             render.cancel,
         )?;
         let rejected = keep.iter().any(|&keep| !keep);
@@ -570,7 +579,7 @@ impl Prepared {
         self.rerender_crowded_target(
             &mut contours,
             support,
-            &self.contours.source_strengths(&self.models),
+            &self.contours.lengths,
             TargetRender {
                 target: (w, h),
                 aa,
@@ -629,19 +638,26 @@ impl Prepared {
     ) -> Result<RgbaImage> {
         let strength = opacity::calculate(&self.widths, &strokes.core, &strokes.owners);
         let paint = opacity::apply(&strokes.coverage, &strokes.owners, &strength);
-        let fill = self
-            .fill_for_target(
-                fill_linear,
-                fill_silhouette,
-                &strokes,
-                FillTarget {
-                    target,
-                    aa,
-                    foreground_support: false,
-                },
-                cancel,
-            )?
-            .linear;
+        let fill = self.fill_for_target(
+            fill_linear,
+            fill_silhouette,
+            &strokes,
+            FillTarget {
+                target,
+                aa,
+                foreground_support: false,
+            },
+            cancel,
+        )?;
+        let support: Vec<bool> = fill.linear.pixels.iter().map(|p| p[3] >= 0.5).collect();
+        let fill = deink::apply(
+            fill.isolated.as_ref().unwrap_or(fill_linear),
+            &self.mask,
+            fill.linear,
+            &strokes.core,
+            &support,
+            cancel,
+        )?;
         let result = paint::composite(&fill, &colors, &paint);
         cancel.check()?;
         Ok(result)
@@ -731,6 +747,7 @@ impl Prepared {
         Ok(FinishedFill {
             linear: fill,
             foreground_support: target_support,
+            isolated,
         })
     }
 
@@ -838,7 +855,7 @@ impl Prepared {
         let rejected = self.rerender_crowded_target(
             &mut contours,
             support,
-            &self.contours.source_strengths(&self.models),
+            &self.contours.lengths,
             TargetRender {
                 target,
                 aa,
@@ -880,7 +897,17 @@ impl Prepared {
             &contours.strokes.owners,
             &strength,
         );
-        let baseline = paint::composite(&fill.linear, &contours.colors, &paint);
+        // The canonical outer core is the only outline: its one-pixel
+        // neighbourhood loses the resampled outline ink.
+        let fill_linear_clean = deink::apply(
+            fill.isolated.as_ref().unwrap_or(fill_linear),
+            &self.mask,
+            fill.linear.clone(),
+            &contours.strokes.core,
+            support,
+            cancel,
+        )?;
+        let baseline = paint::composite(&fill_linear_clean, &contours.colors, &paint);
         foreground_halo::clean(
             foreground_halo::Inputs {
                 support,

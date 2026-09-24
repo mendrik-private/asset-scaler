@@ -28,9 +28,12 @@ to view the full transparent image.
 | :---: | :---: | :---: |
 | <a href="docs/images/elf-source.png"><img src="docs/images/elf-source-preview.svg" width="200" height="200" alt="Original elf illustration shown on mid-gray; click for the transparent PNG"></a> | <img src="docs/images/elf-contours.png" width="200" height="200" alt="Retained contour cores rasterized as white pixels on black"> | <img src="docs/images/elf-fill-mask.png" width="200" height="200" alt="Silhouette fill coverage at 50 percent AA: white interior, gray edge, black exterior"> |
 
-1. **Find and retain contours.** Detect dark ridges in the source, fit curves,
-   thin their rasterization, and join compatible continuations. At the target
-   size, discard very short contours and smooth the retained curves. The
+1. **Find and retain contours.** Detect dark ridges in the source and keep one
+   ridge per ink band, even where a wide outline sits beside dark shading. Fit
+   local curves, fill the slivers between overlapping fits, thin them to a
+   one-pixel skeleton, prune short spurs, and join compatible continuations.
+   At the target size, discard very short contours and fit the retained traces
+   as smooth cubics that only turn sharply at drawn corners. The
    contour panel shows their target-resolution digital cores, before AA or
    source-width opacity is applied; it is not a complete silhouette outline.
 2. **Keep the silhouette.** For this transparent asset, source alpha determines
@@ -42,8 +45,12 @@ to view the full transparent image.
    halo correction and final silhouette coverage. Original painted lines remain
    part of the sampled color; this is not an inpainted, line-free layer.
 4. **Compose the sprite.** Correct halos near retained ink, apply silhouette
-   coverage and intrinsic opacity, then blend sampled ink colors using contour
-   AA coverage and the measured source stroke widths. Convert back to sRGB.
+   coverage and intrinsic opacity. Where a drawn contour edges the removed
+   background, rebuild the outline's resampled ink beside it from the painted
+   interior, so the silhouette outline stays one pixel wide; interior contours
+   and their painted surroundings are left untouched. Then blend sampled ink
+   colors using contour AA coverage and the measured source stroke widths.
+   Convert back to sRGB.
 
 | Resampled color fill | Contour AA coverage · 50% | Composed sprite · 50% |
 | :---: | :---: | :---: |

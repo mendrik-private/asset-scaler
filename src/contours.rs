@@ -10,7 +10,12 @@ use crate::{
 };
 use std::collections::HashSet;
 
-pub const MAX_SHORT_PIXELS: usize = 2;
+/// Target lines shorter than this many pixels are dropped at every size.
+/// A fixed target-space minimum removes proportionally more source detail
+/// the smaller the output gets.
+pub const MIN_LINE_PIXELS: usize = 5;
+/// The longest contour, in distinct target pixels, that is dropped.
+pub const MAX_SHORT_PIXELS: usize = MIN_LINE_PIXELS - 1;
 
 pub struct Contours {
     pub lengths: Vec<f64>,
@@ -246,6 +251,14 @@ impl Contours {
             bridges,
         })
     }
+    /// The ordered source points of every traced contour, by contour id.
+    #[cfg(test)]
+    pub(crate) fn traces(&self) -> impl Iterator<Item = Vec<[f64; 2]>> + '_ {
+        self.paths
+            .iter()
+            .map(|path| path.iter().map(|&node| self.points[node]).collect())
+    }
+
     /// Count distinct in-bounds target pixels along the complete projected
     /// polyline. Endpoints, closed-loop joins and repeated visits count once.
     pub fn pixel_counts(&self, scale: [f64; 2]) -> Vec<usize> {
@@ -282,10 +295,52 @@ impl Contours {
             })
             .collect()
     }
+    /// How many distinct contours pass through each trace node.
+    fn node_occurrences(&self) -> Vec<usize> {
+        let mut occurrences = vec![0usize; self.points.len()];
+        for path in &self.paths {
+            let mut unique = path.clone();
+            unique.sort_unstable();
+            unique.dedup();
+            for node in unique {
+                occurrences[node] += 1;
+            }
+        }
+        occurrences
+    }
+
+    /// Contours longer than `max_removed` target pixels. A shorter contour
+    /// survives only as a connector: an open piece whose both ends join kept
+    /// contours, so dropping it would interrupt a longer drawn line.
     fn selected(&self, scale: [f64; 2], max_removed: usize) -> Vec<bool> {
-        self.pixel_counts(scale)
-            .into_iter()
-            .map(|pixels| pixels > max_removed)
+        let counts = self.pixel_counts(scale);
+        let mut joins_long = vec![0usize; self.points.len()];
+        for (path, _) in self
+            .paths
+            .iter()
+            .zip(&counts)
+            .filter(|&(_, &pixels)| pixels > max_removed)
+        {
+            let mut unique = path.clone();
+            unique.sort_unstable();
+            unique.dedup();
+            for node in unique {
+                joins_long[node] += 1;
+            }
+        }
+        self.paths
+            .iter()
+            .zip(counts)
+            .map(|(path, pixels)| {
+                pixels > max_removed
+                    || (pixels > 0
+                        && match (path.first(), path.last()) {
+                            (Some(&first), Some(&last)) => {
+                                first != last && joins_long[first] > 0 && joins_long[last] > 0
+                            }
+                            _ => false,
+                        })
+            })
             .collect()
     }
 
@@ -318,19 +373,6 @@ impl Contours {
         (retained, owners)
     }
 
-    pub fn source_strengths(&self, models: &[Model]) -> Vec<f64> {
-        let mut strengths = vec![0_f64; self.lengths.len()];
-        for (model, owners) in models.iter().zip(&self.assignments) {
-            for &owner in owners {
-                strengths[owner] = strengths[owner].max(model[9].max(0.));
-            }
-        }
-        for &(owner, model) in &self.bridges {
-            strengths[owner] = strengths[owner].max(model[9].max(0.));
-        }
-        strengths
-    }
-
     /// Explain each retained ordered digital trace with a small collection of
     /// bounded cubic curves. The renderer later approximates them as
     /// quadratics. This consumes the trace graph rather than
@@ -347,15 +389,7 @@ impl Contours {
         // source-space fit may move by at most the source-sized allowance,
         // rather than by four target pixels along the unreduced axis.
         let scale = scale[0].max(scale[1]);
-        let mut occurrences = vec![0usize; self.points.len()];
-        for path in &self.paths {
-            let mut unique = path.clone();
-            unique.sort_unstable();
-            unique.dedup();
-            for node in unique {
-                occurrences[node] += 1;
-            }
-        }
+        let occurrences = self.node_occurrences();
         let mut trace_donors = Vec::new();
         let paths = self
             .paths
@@ -440,41 +474,59 @@ mod tests {
     use crate::{CancellationToken, raster::Mask};
 
     #[test]
+    fn a_short_connector_between_lines_survives_but_a_short_spur_drops() {
+        // Two long lines joined by a short connector (2-3), plus a short
+        // dangling spur (1-4) off the first line.
+        let contours = Contours {
+            points: vec![[0., 0.], [16., 0.], [20., 0.], [36., 0.], [16., 4.]],
+            paths: vec![vec![0, 1], vec![1, 2], vec![2, 3], vec![1, 4]],
+            lengths: vec![16., 4., 16., 4.],
+            assignments: vec![vec![0], vec![1], vec![2], vec![3]],
+            source_size: [40, 8],
+            bridges: Vec::new(),
+        };
+        let counts = contours.pixel_counts([0.5, 0.5]);
+        assert!(counts[1] <= MAX_SHORT_PIXELS && counts[3] <= MAX_SHORT_PIXELS);
+        assert_eq!(
+            contours.selected([0.5, 0.5], MAX_SHORT_PIXELS),
+            [true, true, true, false]
+        );
+    }
+
+    #[test]
     fn short_contours_drop_with_resolution_in_both_render_and_fill_paths() {
         let contours = Contours {
-            // At 50% scale, source x=1..7 visits target x=0..3 (four
-            // pixels); x=9..13 visits x=4..6 (three pixels).
-            points: vec![[1., 1.], [7., 1.], [9., 1.], [13., 1.]],
+            // At 50% scale, source x=1..9 visits target x=0..4 (five
+            // pixels); x=11..17 visits x=5..8 (four pixels).
+            points: vec![[1., 1.], [9., 1.], [11., 1.], [17., 1.]],
             paths: vec![vec![0, 1], vec![2, 3]],
-            lengths: vec![6., 4.],
+            lengths: vec![8., 6.],
             assignments: vec![vec![0], vec![1]],
-            source_size: [16, 4],
+            source_size: [20, 4],
             bridges: Vec::new(),
         };
         let models = vec![[0.; 10], [1.; 10]];
         let half = [0.5, 0.5];
-        assert_eq!(contours.pixel_counts(half), vec![4, 3]);
+        assert_eq!(contours.pixel_counts(half), vec![5, 4]);
         let (retained, owners) = contours.retain_with_ids(&models, half, MAX_SHORT_PIXELS);
-        assert_eq!(retained.len(), 2);
-        assert_eq!(owners, vec![0, 1]);
+        assert_eq!(retained.len(), 1);
+        assert_eq!(owners, vec![0]);
 
-        let mut footprint = Mask::new(16, 4);
-        for x in 1..=7 {
-            footprint.data[16 + x] = true;
-        }
-        for x in 9..=13 {
-            footprint.data[16 + x] = true;
+        let mut footprint = Mask::new(20, 4);
+        for x in (1..=9).chain(11..=17) {
+            footprint.data[20 + x] = true;
         }
         let retained = contours
             .retained_ink_mask(&footprint, half, &CancellationToken::default())
             .unwrap();
-        assert!((1..=7).all(|x| retained.data[16 + x]));
-        assert!((9..=13).all(|x| retained.data[16 + x]));
+        assert!((1..=9).all(|x| retained.data[20 + x]));
+        // Ink owned by the dropped four-pixel line stays in the fill.
+        assert!((11..=17).all(|x| !retained.data[20 + x]));
 
-        // Both curves project to two pixels at 25%, so resolution removes
+        // Both curves project to three pixels at 25%, so resolution removes
         // their redraw and halo-mask membership.
         let quarter = [0.25, 0.25];
-        assert_eq!(contours.pixel_counts(quarter), vec![2, 2]);
+        assert_eq!(contours.pixel_counts(quarter), vec![3, 3]);
         let (retained, owners) = contours.retain_with_ids(&models, quarter, MAX_SHORT_PIXELS);
         assert!(retained.is_empty());
         assert!(owners.is_empty());

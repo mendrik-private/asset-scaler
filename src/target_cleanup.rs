@@ -233,7 +233,7 @@ fn remove_short_components(mask: &mut Mask, cancel: &dyn Cancellation) -> Result
                 }
             }
         }
-        if component.len() < 3 {
+        if component.len() < crate::contours::MIN_LINE_PIXELS {
             for &pixel in &component {
                 mask.data[pixel] = false;
             }
@@ -462,11 +462,21 @@ mod tests {
     #[test]
     fn full_support_and_border_masks_have_finite_outer_priority() {
         let raw = mask(
-            5,
-            5,
-            &[(0, 0), (1, 0), (0, 1), (1, 1), (2, 2), (3, 3), (4, 4)],
+            7,
+            7,
+            &[
+                (0, 0),
+                (1, 0),
+                (0, 1),
+                (1, 1),
+                (2, 2),
+                (3, 3),
+                (4, 4),
+                (5, 5),
+                (6, 6),
+            ],
         );
-        let cleaned = thin_outer(&raw, &[true; 25], &CancellationToken::default()).unwrap();
+        let cleaned = thin_outer(&raw, &[true; 49], &CancellationToken::default()).unwrap();
         assert!(cleaned.data.iter().any(|&on| on));
         assert!(no_redundant_corner(&cleaned));
         assert!(
@@ -482,7 +492,7 @@ mod tests {
     fn diagonal_and_steep_parallel_union_becomes_one_thin_connected_path() {
         let raw = mask(
             8,
-            8,
+            11,
             &[
                 (1, 1),
                 (2, 1),
@@ -496,13 +506,17 @@ mod tests {
                 (4, 5),
                 (3, 6),
                 (4, 6),
+                (4, 7),
+                (5, 7),
+                (4, 8),
+                (5, 8),
             ],
         );
-        let cleaned = thin_outer(&raw, &[false; 64], &CancellationToken::default()).unwrap();
+        let cleaned = thin_outer(&raw, &[false; 88], &CancellationToken::default()).unwrap();
         assert!(no_redundant_corner(&cleaned), "{:?}", cleaned.data);
         assert!(!has_redundant_pixel(&cleaned));
         assert_eq!(component_sizes(&cleaned).len(), 1, "{:?}", cleaned.data);
-        assert!(component_sizes(&cleaned)[0] >= 3, "{:?}", cleaned.data);
+        assert!(component_sizes(&cleaned)[0] >= 5, "{:?}", cleaned.data);
         assert!(
             cleaned
                 .data
@@ -562,11 +576,24 @@ mod tests {
 
     #[test]
     fn redundant_l_on_a_long_diagonal_is_collapsed_without_breaking_the_path() {
-        let raw = mask(6, 6, &[(1, 1), (2, 1), (2, 2), (3, 3), (4, 4)]);
-        let cleaned = thin_outer(&raw, &[false; 36], &CancellationToken::default()).unwrap();
+        let raw = mask(
+            9,
+            9,
+            &[
+                (1, 1),
+                (2, 1),
+                (2, 2),
+                (3, 3),
+                (4, 4),
+                (5, 5),
+                (6, 6),
+                (7, 7),
+            ],
+        );
+        let cleaned = thin_outer(&raw, &[false; 81], &CancellationToken::default()).unwrap();
         assert!(!has_redundant_pixel(&cleaned), "{:?}", cleaned.data);
         assert_eq!(component_sizes(&cleaned).len(), 1, "{:?}", cleaned.data);
-        assert!(component_sizes(&cleaned)[0] >= 3, "{:?}", cleaned.data);
+        assert!(component_sizes(&cleaned)[0] >= 5, "{:?}", cleaned.data);
     }
 
     #[test]
@@ -577,12 +604,27 @@ mod tests {
     }
 
     #[test]
-    fn joined_short_fragments_survive_but_isolated_pairs_drop() {
-        let raw = mask(9, 4, &[(1, 1), (2, 1), (3, 2), (6, 2), (7, 2)]);
-        let cleaned = thin_outer(&raw, &[false; 36], &CancellationToken::default()).unwrap();
-        assert!(cleaned.data[1 + 9] || cleaned.data[2 + 9] || cleaned.data[3 + 18]);
-        assert!(component_sizes(&cleaned).iter().all(|&size| size >= 3));
-        assert!(!cleaned.data[6 + 18] && !cleaned.data[7 + 18]);
+    fn joined_fragments_of_five_pixels_survive_but_shorter_lines_drop() {
+        // Two touching fragments join into one five-pixel line; the separate
+        // four-pixel run on the right is below the minimum line length.
+        let raw = mask(
+            14,
+            4,
+            &[
+                (1, 1),
+                (2, 1),
+                (3, 2),
+                (4, 2),
+                (5, 2),
+                (9, 2),
+                (10, 2),
+                (11, 2),
+                (12, 2),
+            ],
+        );
+        let cleaned = thin_outer(&raw, &[false; 56], &CancellationToken::default()).unwrap();
+        assert_eq!(component_sizes(&cleaned), vec![5], "{:?}", cleaned.data);
+        assert!((9..=12).all(|x| !cleaned.data[2 * 14 + x]));
     }
 
     #[test]
@@ -641,8 +683,23 @@ mod tests {
 
     #[test]
     fn distant_already_thin_components_are_unchanged() {
-        let raw = mask(10, 4, &[(1, 1), (2, 1), (3, 1), (6, 2), (7, 2), (8, 2)]);
-        let cleaned = thin_outer(&raw, &[false; 40], &CancellationToken::default()).unwrap();
+        let raw = mask(
+            14,
+            4,
+            &[
+                (1, 1),
+                (2, 1),
+                (3, 1),
+                (4, 1),
+                (5, 1),
+                (8, 2),
+                (9, 2),
+                (10, 2),
+                (11, 2),
+                (12, 2),
+            ],
+        );
+        let cleaned = thin_outer(&raw, &[false; 56], &CancellationToken::default()).unwrap();
         assert_eq!(cleaned.data, raw.data);
     }
 

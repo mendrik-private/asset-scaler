@@ -392,7 +392,8 @@ fn foreground_ink_is_opt_in_and_cannot_change_legacy_foreground_output() {
 fn foreground_ink_coalesces_adjacent_target_runs_at_every_scale() {
     let source = Arc::new(RgbaImage::from_fn(96, 96, |x, y| {
         if (12..84).contains(&x) && (12..84).contains(&y) {
-            if (42..=45).contains(&y) && (24..72).contains(&x) && (y == 42 || y == 45) {
+            // Long enough to stay an interior line even at a 24px target.
+            if (42..=45).contains(&y) && (14..82).contains(&x) && (y == 42 || y == 45) {
                 Rgba([0, 0, 0, 255])
             } else {
                 Rgba([140, 90, 60, 255])

@@ -3,6 +3,21 @@ use crate::{Cancellation, Result};
 use crate::{contours::Contours, detect::Sample, raster::Mask};
 use image::{GrayImage, RgbaImage};
 
+/// The median of finite measurements, or zero when there are none. An even
+/// count averages its two middle values.
+fn median(mut values: Vec<f64>) -> f64 {
+    if values.is_empty() {
+        return 0.;
+    }
+    values.sort_by(f64::total_cmp);
+    let middle = values.len() / 2;
+    if values.len().is_multiple_of(2) {
+        (values[middle - 1] + values[middle]) * 0.5
+    } else {
+        values[middle]
+    }
+}
+
 pub fn strength(length: usize, width: f64) -> f64 {
     let length = ((length as f64 - 4.) / 28.).clamp(0., 1.);
     let width = ((width - 1.) / 5.).clamp(0., 1.);
@@ -36,22 +51,23 @@ pub fn widths(
     contours: &Contours,
     cancel: &dyn Cancellation,
 ) -> Result<Vec<f64>> {
-    let n = contours.lengths.len();
-    let mut total = vec![0.; n];
-    let mut count = vec![0; n];
+    // The median band width: where strokes cross or merge, a sample measures
+    // along the other stroke's ink, and those outliers must not thicken a
+    // contour's opacity and crowding rank.
+    let mut measured = vec![Vec::new(); contours.lengths.len()];
     for (p, owner) in samples.iter().zip(contours.sample_owners(samples)) {
         cancel.check()?;
         if let (Some(id), Some(width)) = (owner, measure(source, mask, p)) {
-            total[id] += width;
-            count[id] += 1;
+            measured[id].push(width);
         }
     }
-    Ok((0..n)
-        .map(|id| {
-            if count[id] > 0 {
-                total[id] / count[id] as f64
-            } else {
+    Ok(measured
+        .into_iter()
+        .map(|widths| {
+            if widths.is_empty() {
                 1.
+            } else {
+                median(widths)
             }
         })
         .collect())

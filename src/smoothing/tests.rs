@@ -323,3 +323,37 @@ fn opposing_inherited_two_point_tangents_contract_within_the_reported_bound() {
         "two-point leaf deviated {dense_error}, despite reported {reported_error}"
     );
 }
+
+#[test]
+fn shallow_raster_staircase_is_one_smooth_curve() {
+    // A thinned digital line of slope 1/4 alternates flat runs and steps.
+    // Neither the steps nor the split tangents may introduce corners.
+    let mut mask = Mask::new(64, 24);
+    for x in 4..60 {
+        mask.data[(4 + (x - 4) / 4) * mask.w + x] = true;
+    }
+    let cancel = CancellationToken::default();
+    let contours = Contours::new(&mask, &[], &cancel).unwrap();
+    let fitted = contours.polished([1., 1.], 0, &cancel).unwrap();
+    assert!(
+        fitted.cubic_curves.len() <= 2,
+        "staircase needed {} cubics",
+        fitted.cubic_curves.len()
+    );
+    for pair in fitted.cubic_curves.windows(2) {
+        assert!(g1(pair[0], pair[1]), "staircase join lost G1");
+    }
+    let direction = unit(sub(
+        fitted.cubic_curves.last().unwrap()[3],
+        fitted.cubic_curves[0][0],
+    ));
+    for cubic in &fitted.cubic_curves {
+        for tangent in [tangent_start(*cubic), tangent_end(*cubic)] {
+            assert!(
+                dot2(unit(tangent), direction) > 0.97,
+                "tangent follows a raster step"
+            );
+        }
+    }
+    assert!(fitted.max_error <= 1.0);
+}

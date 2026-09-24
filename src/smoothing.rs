@@ -66,25 +66,6 @@ fn unit(v: [f64; 2]) -> [f64; 2] {
     if n <= 1e-12 { [1., 0.] } else { mul(v, 1. / n) }
 }
 
-/// An arclength-scale endpoint direction.  It looks past individual raster
-/// stairs, including diagonal staircases whose point indices are misleading.
-fn endpoint_tangent(path: &[[f64; 2]], start: bool) -> [f64; 2] {
-    let end = if start { 0 } else { path.len() - 1 };
-    let step: isize = if start { 1 } else { -1 };
-    let mut i = end as isize;
-    let mut travelled = 0.;
-    while (0..path.len() as isize).contains(&(i + step)) && travelled < 3. {
-        let next = i + step;
-        travelled += norm(sub(path[next as usize], path[i as usize]));
-        i = next;
-    }
-    unit(if start {
-        sub(path[i as usize], path[0])
-    } else {
-        sub(path[path.len() - 1], path[i as usize])
-    })
-}
-
 /// Tangent-constrained cubic least squares with chord-length parameters.
 /// Independent handle lengths allow every recursive join to share an exact
 /// tangent direction without moving the graph's anchors.
@@ -216,6 +197,42 @@ fn cubic_error(c: Cubic, path: &[[f64; 2]], cancel: &dyn Cancellation) -> Result
     Ok((error, split.clamp(1, path.len().saturating_sub(2).max(1))))
 }
 
+/// Arclength over which a trace direction is measured. Thinned rasters turn
+/// by 45 or 90 degrees at every staircase step and detector jitter bends them
+/// over a few pixels, so only a turn that persists over this reach is drawn.
+const CORNER_REACH: f64 = 3.;
+/// Cosine below which a persistent turn is a drawn corner (about 63 degrees).
+const CORNER_COSINE: f64 = 0.45;
+
+/// The index reached by walking `reach` source pixels from `from`.
+fn walk(path: &[[f64; 2]], from: usize, forward: bool, reach: f64) -> usize {
+    let mut at = from;
+    let mut travelled = 0.;
+    while travelled < reach {
+        let next = if forward {
+            if at + 1 >= path.len() {
+                break;
+            }
+            at + 1
+        } else {
+            let Some(next) = at.checked_sub(1) else {
+                break;
+            };
+            next
+        };
+        travelled += norm(sub(path[next], path[at]));
+        at = next;
+    }
+    at
+}
+
+fn turn_cosine(path: &[[f64; 2]], i: usize) -> Option<f64> {
+    let before = sub(path[i], path[walk(path, i, false, CORNER_REACH)]);
+    let after = sub(path[walk(path, i, true, CORNER_REACH)], path[i]);
+    let lengths = norm(before) * norm(after);
+    (lengths > 1e-8).then(|| dot2(before, after) / lengths)
+}
+
 fn corner_indices(path: &[[f64; 2]], closed: bool, locked: &[usize]) -> (Vec<usize>, Vec<usize>) {
     let last = path.len().saturating_sub(1);
     if last < 4 {
@@ -227,16 +244,29 @@ fn corner_indices(path: &[[f64; 2]], closed: bool, locked: &[usize]) -> (Vec<usi
     }
     let mut anchors = vec![0];
     let mut hard = Vec::new();
-    // Direction across a 3px neighbourhood ignores the alternating horizontal
-    // and vertical steps of a thinned raster line.
+    // A corner is the sharpest turn within its own measuring reach, so one
+    // drawn bend yields one anchor however many staircase steps it spans.
+    let cosines: Vec<_> = (0..=last)
+        .map(|i| {
+            (i >= 2 && i + 2 <= last)
+                .then(|| turn_cosine(path, i))
+                .flatten()
+        })
+        .collect();
     for i in 2..last.saturating_sub(1) {
-        let before = sub(path[i], path[i.saturating_sub(2)]);
-        let after = sub(path[(i + 2).min(last)], path[i]);
-        let lengths = norm(before) * norm(after);
-        if lengths > 1e-8
-            && dot2(before, after) / lengths < 0.45
-            && anchors.last().is_none_or(|&old| i > old + 2)
-        {
+        let Some(cosine) = cosines[i] else {
+            continue;
+        };
+        if cosine >= CORNER_COSINE {
+            continue;
+        }
+        let (from, to) = (
+            walk(path, i, false, CORNER_REACH),
+            walk(path, i, true, CORNER_REACH),
+        );
+        let sharpest = (from..=to)
+            .all(|j| cosines[j].is_none_or(|other| other > cosine || (other == cosine && j >= i)));
+        if sharpest && anchors.last().is_none_or(|&old| i > old + 2) {
             anchors.push(i);
             hard.push(i);
         }
@@ -254,7 +284,7 @@ fn corner_indices(path: &[[f64; 2]], closed: bool, locked: &[usize]) -> (Vec<usi
         let before = sub(path[0], path[last - 2]);
         let after = sub(path[2], path[0]);
         let lengths = norm(before) * norm(after);
-        if lengths > 1e-8 && dot2(before, after) / lengths < 0.45 {
+        if lengths > 1e-8 && dot2(before, after) / lengths < CORNER_COSINE {
             hard.extend([0, last]);
         }
     }
@@ -268,29 +298,66 @@ fn corner_indices(path: &[[f64; 2]], closed: bool, locked: &[usize]) -> (Vec<usi
     (anchors, hard)
 }
 
-fn anchor_tangent(
-    path: &[[f64; 2]],
-    index: usize,
-    closed: bool,
-    hard: bool,
-    starts_span: bool,
-) -> [f64; 2] {
-    if hard {
-        let span = if starts_span {
-            &path[index..=(index + 2).min(path.len() - 1)]
-        } else {
-            &path[index.saturating_sub(2)..=index]
-        };
-        return endpoint_tangent(span, starts_span);
+/// Binomial passes applied between fixed anchors before fitting; four passes
+/// approximate a Gaussian with a 1.4px standard deviation along the trace.
+const SMOOTHING_PASSES: usize = 4;
+
+/// Remove raster stairs and detector jitter from a span with fixed ends.
+/// Returns the smoothed span and the largest vertex displacement, which the
+/// caller adds to the fit error so the reported bound still refers to the
+/// original trace.
+fn smooth_span(span: &[[f64; 2]]) -> (Vec<[f64; 2]>, f64) {
+    let mut smoothed = span.to_vec();
+    if span.len() < 3 {
+        return (smoothed, 0.);
     }
+    let mut next = smoothed.clone();
+    for _ in 0..SMOOTHING_PASSES {
+        for i in 1..span.len() - 1 {
+            next[i] = mul(
+                add(add(smoothed[i - 1], smoothed[i + 1]), mul(smoothed[i], 2.)),
+                0.25,
+            );
+        }
+        std::mem::swap(&mut smoothed, &mut next);
+    }
+    let displacement = span
+        .iter()
+        .zip(&smoothed)
+        .map(|(&a, &b)| norm(sub(a, b)))
+        .fold(0., f64::max);
+    (smoothed, displacement)
+}
+
+/// The shared tangent of a smooth anchor: both adjacent spans use this same
+/// direction, measured symmetrically over the corner reach, so they join G1.
+fn anchor_tangent(path: &[[f64; 2]], index: usize, closed: bool) -> [f64; 2] {
     let last = path.len() - 1;
     if closed && (index == 0 || index == last) && last >= 4 {
-        return unit(sub(path[2], path[last - 2]));
+        return unit(sub(
+            path[walk(path, 0, true, CORNER_REACH)],
+            path[walk(path, last, false, CORNER_REACH)],
+        ));
     }
     unit(sub(
-        path[(index + 2).min(last)],
-        path[index.saturating_sub(2)],
+        path[walk(path, index, true, CORNER_REACH)],
+        path[walk(path, index, false, CORNER_REACH)],
     ))
+}
+
+/// The one-sided tangent at a hard anchor (a corner or a free line end).
+/// A raster line end or corner leg often starts with a flat run several
+/// pixels long, so it looks up to twice the corner reach into its own span,
+/// but never past the span's middle.
+fn hard_tangent(span: &[[f64; 2]], start: bool) -> [f64; 2] {
+    let length: f64 = span.windows(2).map(|e| norm(sub(e[1], e[0]))).sum();
+    let reach = (length * 0.5).min(2. * CORNER_REACH);
+    if start {
+        unit(sub(span[walk(span, 0, true, reach)], span[0]))
+    } else {
+        let last = span.len() - 1;
+        unit(sub(span[last], span[walk(span, last, false, reach)]))
+    }
 }
 
 fn fit_span(
@@ -329,7 +396,12 @@ fn fit_span(
         output.push(cubic);
         return Ok(());
     }
-    let tangent = unit(sub(path[(split + 1).min(path.len() - 1)], path[split - 1]));
+    // A neighbour chord on a raster staircase is off by up to 45 degrees and
+    // would force a kink into both halves; measure over the corner reach.
+    let tangent = unit(sub(
+        path[walk(path, split, true, CORNER_REACH)],
+        path[walk(path, split, false, CORNER_REACH)],
+    ));
     fit_span(
         &path[..=split],
         tolerance,
@@ -399,17 +471,34 @@ pub fn fit_paths(
         let closed = path.first() == path.last();
         let (anchors, hard) = corner_indices(&path, closed, &locked);
         for edge in anchors.windows(2) {
-            let span = &path[edge[0]..=edge[1]];
+            let (span, displacement) = smooth_span(&path[edge[0]..=edge[1]]);
             let mut pieces = Vec::new();
+            let mut span_error = 0.;
+            // Smoothing may use at most half of the allowance. A span it would
+            // move further keeps its original vertices.
+            let (span, displacement) = if displacement <= tolerance * 0.5 {
+                (span, displacement)
+            } else {
+                (path[edge[0]..=edge[1]].to_vec(), 0.)
+            };
             fit_span(
-                span,
-                tolerance,
+                &span,
+                tolerance - displacement,
                 cancel,
-                anchor_tangent(&path, edge[0], closed, hard.contains(&edge[0]), true),
-                anchor_tangent(&path, edge[1], closed, hard.contains(&edge[1]), false),
+                if hard.contains(&edge[0]) {
+                    hard_tangent(&span, true)
+                } else {
+                    anchor_tangent(&path, edge[0], closed)
+                },
+                if hard.contains(&edge[1]) {
+                    hard_tangent(&span, false)
+                } else {
+                    anchor_tangent(&path, edge[1], closed)
+                },
                 &mut pieces,
-                &mut fitted.max_error,
+                &mut span_error,
             )?;
+            fitted.max_error = fitted.max_error.max(span_error + displacement);
             let before = fitted.curves.len();
             for cubic in pieces {
                 fitted.cubic_curves.push(cubic);
